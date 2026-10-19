@@ -1,7 +1,7 @@
 //! Command-line client for a node's local Unix socket.
 
 use clap::{Parser, Subcommand};
-use kvdist::client::LocalClient;
+use kvdist::client::{LocalClient, WatchEvent};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -45,6 +45,14 @@ enum Cmd {
     },
     /// Node status as JSON.
     Status,
+    /// Print changes under prefixes as they commit, one line each:
+    /// `<index> set <key> <value>`, `<index> del <key>` or `<index> resync`.
+    Watch {
+        prefixes: Vec<String>,
+        /// Start at this index instead of the next commit.
+        #[arg(long, default_value_t = 0)]
+        from: u64,
+    },
     /// Print a `--auth-tokens` line for a token without storing it in clear text.
     HashToken {
         #[arg(value_parser = ["read", "write"])]
@@ -76,6 +84,28 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
         return Ok(ExitCode::SUCCESS);
     }
     let mut kv = LocalClient::connect(&cli.socket).await?;
+    if let Cmd::Watch { prefixes, from } = cli.cmd {
+        let mut w = kv.watch(&prefixes, from).await?;
+        loop {
+            match w.next().await? {
+                WatchEvent::Changes { index, changes, .. } => {
+                    for c in changes {
+                        let key = String::from_utf8_lossy(&c.key);
+                        match c.value {
+                            Some(v) => {
+                                write!(out, "{index} set {key} ")?;
+                                out.write_all(&v)?;
+                                writeln!(out)?;
+                            }
+                            None => writeln!(out, "{index} del {key}")?,
+                        }
+                    }
+                }
+                WatchEvent::Resync { index } => writeln!(out, "{index} resync")?,
+            }
+            out.flush()?;
+        }
+    }
     match cli.cmd {
         Cmd::Get { key } => {
             let (index, item) = kv.get_one(key, cli.min_index).await?;
@@ -105,7 +135,7 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
                 out.write_all(b"\n")?;
             }
         }
-        Cmd::HashToken { .. } => unreachable!("handled above"),
+        Cmd::HashToken { .. } | Cmd::Watch { .. } => unreachable!("handled above"),
         Cmd::Status => writeln!(
             out,
             "{}",

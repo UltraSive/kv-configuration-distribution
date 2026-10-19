@@ -6,6 +6,7 @@ use crate::auth::Tokens;
 use crate::cache::{CacheIndex, CacheLimits, SharedCache, free_disk_bytes};
 use crate::config::{Config, Role};
 use crate::error::WriteError;
+use crate::feed::Feed;
 use crate::protocol::{RpcReq, RpcResp};
 use crate::rpc::{CallError, RpcPool};
 use crate::store::Store;
@@ -117,6 +118,8 @@ pub struct Node {
     /// HTTP bearer tokens; `None` leaves the HTTP API open.
     pub tokens: Option<Tokens>,
     pub metrics: Metrics,
+    /// Applied entries, for watchers.
+    pub feed: Arc<Feed>,
 }
 
 pub struct ReadOpts {
@@ -156,7 +159,9 @@ impl Node {
             max_value_bytes: cfg.max_value_bytes,
             max_txn_ops: cfg.max_txn_ops,
         };
-        let (applier, applied, join) = Applier::spawn(store.clone(), acfg, cache.clone())?;
+        let feed = Arc::new(Feed::new(cfg.role == Role::Proxy));
+        let (applier, applied, join) =
+            Applier::spawn(store.clone(), acfg, cache.clone(), feed.clone())?;
         let node_id = store.node_id();
         let proxy = cache.map(|cache| ProxyState {
             cache,
@@ -176,6 +181,7 @@ impl Node {
             tls,
             tokens,
             metrics: Metrics::default(),
+            feed,
         };
         Ok((Arc::new(node), join))
     }

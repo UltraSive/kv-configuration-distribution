@@ -4,6 +4,7 @@
 use crate::cache::{CacheLimits, SharedCache, entry_size};
 use crate::config::Role;
 use crate::error::{Error, Result, WriteError};
+use crate::feed::Feed;
 use crate::store::{ApplyMode, Store};
 use crate::types::*;
 use fjall::PersistMode;
@@ -64,6 +65,7 @@ impl Applier {
         store: Arc<Store>,
         cfg: ApplierConfig,
         cache: Option<SharedCache>,
+        feed: Arc<Feed>,
     ) -> std::io::Result<(Applier, watch::Receiver<Index>, JoinHandle<()>)> {
         let (tx, rx) = mpsc::channel(4096);
         let (applied_tx, applied_rx) = watch::channel(store.state().applied);
@@ -72,6 +74,7 @@ impl Applier {
             cfg,
             cache,
             applied_tx,
+            feed,
         };
         let handle = std::thread::Builder::new()
             .name("kv-applier".into())
@@ -135,6 +138,7 @@ struct Worker {
     cfg: ApplierConfig,
     cache: Option<SharedCache>,
     applied_tx: watch::Sender<Index>,
+    feed: Arc<Feed>,
 }
 
 impl Worker {
@@ -183,8 +187,12 @@ impl Worker {
                     hash,
                     reply,
                 } => {
-                    let _ = reply.send(self.store.finish_bootstrap(db_id, index, hash));
+                    let res = self.store.finish_bootstrap(db_id, index, hash);
                     self.publish();
+                    if res.is_ok() {
+                        self.feed.reset(index);
+                    }
+                    let _ = reply.send(res);
                 }
                 Cmd::CacheFill { items } => self.cache_fill(&items),
                 Cmd::Maintain => self.maintain(),
@@ -227,6 +235,7 @@ impl Worker {
             }
         }
         self.publish();
+        self.feed.publish(entries);
         Ok(())
     }
 
@@ -326,6 +335,7 @@ impl Worker {
         {
             Ok(()) => {
                 self.publish();
+                self.feed.publish(&entries);
                 for (reply, e) in replies.into_iter().zip(&entries) {
                     let _ = reply.send(Ok(e.index));
                 }

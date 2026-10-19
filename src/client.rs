@@ -11,7 +11,7 @@
 
 use crate::node::Status;
 use crate::protocol;
-use crate::socket::{ClientError, Item, LocalReq, LocalResp};
+use crate::socket::{Change, ClientError, Item, LocalReq, LocalResp};
 use crate::types::*;
 use serde_bytes::ByteBuf;
 use std::path::Path;
@@ -132,6 +132,83 @@ impl LocalClient {
         match self.call(&LocalReq::Status).await? {
             LocalResp::Status(s) => Ok(*s),
             other => Err(unexpected(other)),
+        }
+    }
+
+    /// Streams changes under `prefixes` (all keys if empty) from index
+    /// `from`, or from the next commit if `from` is 0. The usual pattern is
+    /// to `scan` first and then watch from the scan's index + 1, so nothing
+    /// is missed in between. Takes over the connection.
+    pub async fn watch<P: AsRef<[u8]>>(
+        mut self,
+        prefixes: &[P],
+        from: Index,
+    ) -> Result<Watcher, ClientError> {
+        let prefixes = prefixes.iter().map(|p| ByteBuf::from(p.as_ref())).collect();
+        match self.call(&LocalReq::Watch { prefixes, from }).await? {
+            LocalResp::Watching { index } => Ok(Watcher {
+                conn: self.conn,
+                index,
+            }),
+            other => Err(unexpected(other)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WatchEvent {
+    /// The matching changes of one committed transaction.
+    Changes {
+        index: Index,
+        timestamp_ms: u64,
+        changes: Vec<Change>,
+    },
+    /// The node's data was replaced at `index`: re-read the keys you care
+    /// about (e.g. `scan` with `min_index: index`); changes after it follow.
+    Resync { index: Index },
+}
+
+/// A watch stream from [`LocalClient::watch`].
+pub struct Watcher {
+    conn: Framed<UnixStream, LengthDelimitedCodec>,
+    index: Index,
+}
+
+impl Watcher {
+    /// Everything up to and including this index has been delivered.
+    pub fn index(&self) -> Index {
+        self.index
+    }
+
+    /// Waits for the next change. `Err(ClientError::Gone)` means the
+    /// history needed to continue was dropped: re-read and watch again.
+    pub async fn next(&mut self) -> Result<WatchEvent, ClientError> {
+        loop {
+            let resp = protocol::recv::<_, LocalResp>(&mut self.conn)
+                .await
+                .map_err(io)?
+                .ok_or_else(|| ClientError::Io("server closed the connection".into()))?;
+            match resp {
+                LocalResp::Progress { index } => self.index = index,
+                LocalResp::Changes {
+                    index,
+                    timestamp_ms,
+                    changes,
+                } => {
+                    self.index = index;
+                    return Ok(WatchEvent::Changes {
+                        index,
+                        timestamp_ms,
+                        changes,
+                    });
+                }
+                LocalResp::Resync { index } => {
+                    self.index = index;
+                    return Ok(WatchEvent::Resync { index });
+                }
+                LocalResp::Error(e) => return Err(e),
+                other => return Err(unexpected(other)),
+            }
         }
     }
 }

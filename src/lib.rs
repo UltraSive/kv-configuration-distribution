@@ -8,6 +8,7 @@ pub mod cache;
 pub mod client;
 pub mod config;
 pub mod error;
+pub mod feed;
 pub mod node;
 pub mod protocol;
 pub mod replication;

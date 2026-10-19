@@ -165,15 +165,55 @@ are in `src/socket.rs`.
 
 ```rust
 enum LocalReq  { Get { keys, min_index }, Scan { prefix, after, limit, min_index },
-                 Txn { txn, wait }, Status }
+                 Txn { txn, wait }, Status, Watch { prefixes, from } }
 enum LocalResp { Values { index, items: Vec<Option<Item>> }, Scanned { index, items },
-                 Committed { index }, Status(Status), Error(ClientError) }
+                 Committed { index }, Status(Status), Error(ClientError),
+                 // watch frames
+                 Watching { index }, Changes { index, timestamp_ms, changes },
+                 Progress { index }, Resync { index } }
 ```
 
 Errors are typed (`Conflict`, `Timeout`, `Unavailable`, `UnknownOutcome`, ...).
 A frame that can't be decoded gets an `Error(BadRequest)` reply and the
 connection stays open. New message variants are only ever appended, so older
 clients keep working.
+
+**Watching for changes.** `Watch { prefixes, from }` turns the connection
+into a stream. It covers keys under any of the prefixes, or every key if the
+list is empty. Changes start at index `from`, or at the next commit if `from`
+is 0. The node replies `Watching { index }`, then sends one frame per event:
+
+- `Changes { index, timestamp_ms, changes }`: one per committed transaction
+  that touched a matching key, in index order. Each change is `{ key, value }`,
+  where a `None` value means the key was deleted. Only the matching ops are
+  included.
+- `Progress { index }`: sent after 5s with nothing to report. Nothing matching
+  was committed up to `index`, and it shows the connection is still alive.
+- `Resync { index }`: the node's data was replaced wholesale, by a snapshot
+  install or a proxy cache reset. Re-read what you need at `index`; changes
+  after it follow.
+- `Error(Gone { floor })`: `from` is older than the history this node still
+  has. Re-read and watch again.
+
+Replicas and the root replay old changes from their log, back to
+`--log-retention`. Proxies keep no log, only the last 10,000 entries (up to
+16 MiB) in memory, so they can replay a short gap. A watcher that falls far
+behind live traffic catches up the same way, without missing anything. Writes
+reach watchers as soon as they are visible to reads on that node.
+
+To avoid missing changes between reading and watching, scan first, then watch
+from the scan's index + 1:
+
+```rust
+let (at, items) = kv.scan("app/", None, 1000, 0).await?;
+let mut w = kv.watch(&["app/"], at + 1).await?;
+loop {
+    match w.next().await? {
+        WatchEvent::Changes { index, changes, .. } => { /* apply */ }
+        WatchEvent::Resync { index } => { /* re-scan with min_index: index */ }
+    }
+}
+```
 
 **Rust client** (`kvdist::client::LocalClient`):
 
@@ -192,6 +232,8 @@ kvctl get service/ttl                # raw value; exit 1 if absent
 kvctl --min-index 42 get service/ttl # wait until this node has index 42
 kvctl scan service/                  # key<TAB>value lines
 kvctl status
+kvctl watch app/ flags/              # "<index> set <key> <value>" / "<index> del <key>"
+kvctl watch --from 1                 # replay everything still in the log, then follow
 ```
 
 Clients in other languages need a postcard implementation; the format is
@@ -270,6 +312,7 @@ curl --unix-socket /run/kvdist-http.sock -H "authorization: Bearer $READ_TOKEN" 
 src/types.rs        indexes, ids, ops, hash-chained LogEntry, CRC'd Record
 src/store.rs        fjall keyspaces: data, history (MVCC), log, meta
 src/applier.rs      single writer thread: group commit, CAS, pruning, eviction
+src/feed.rs         in-process feed of applied entries for watchers
 src/protocol.rs     peer wire protocol (postcard frames)
 src/replication.rs  upstream server (handshake, snapshot, stream) + follower
 src/rpc.rs          peer RPC pool (proxy reads, write forwarding)
@@ -282,6 +325,7 @@ src/client.rs       Unix socket client library
 src/bin/kvctl.rs    socket CLI
 tests/cluster.rs    multi-node tests over real sockets
 tests/security.rs   mTLS, HTTPS, tokens, HTTP socket
+tests/watch.rs      watching prefixes over the socket
 ```
 
 ## Not (yet) implemented
