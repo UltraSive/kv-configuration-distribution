@@ -2,12 +2,12 @@
 
 use crate::config::{Config, Role};
 use crate::node::Node;
-use crate::{api, replication};
+use crate::{api, replication, socket};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
-use tokio::net::{TcpListener, UnixListener};
+use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
@@ -54,9 +54,8 @@ pub async fn start(mut cfg: Config) -> anyhow::Result<Running> {
     });
 
     if let Some(path) = &cfg.socket {
-        let _ = std::fs::remove_file(path);
-        let listener = UnixListener::bind(path)?;
-        tracker.spawn(api::serve_socket(
+        let listener = socket::bind(path)?;
+        tracker.spawn(socket::serve(
             node.clone(),
             listener,
             cancel.clone(),

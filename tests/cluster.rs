@@ -528,3 +528,94 @@ async fn proxy_hard_limit_stops_caching_but_still_serves() {
     rep.shutdown().await;
     root.shutdown().await;
 }
+
+#[tokio::test]
+async fn unix_socket_postcard_api() {
+    use futures::{SinkExt, StreamExt};
+    use kvdist::client::LocalClient;
+    use kvdist::socket::{ClientError, LocalReq, LocalResp};
+    use tokio_util::codec::Framed;
+
+    let (d1, d2) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let root = server::start(cfg(Role::Root, &d1, &[])).await.unwrap();
+    let mut rc = cfg(Role::Replica, &d2, &[&root]);
+    let sock = d2.path().join("kv.sock");
+    rc.socket = Some(sock.clone());
+    rc.read_wait_ms = 200;
+    let rep = server::start(rc).await.unwrap();
+    let mut kv = LocalClient::connect(&sock).await.unwrap();
+
+    // Writes through the replica's socket are forwarded to the root, and
+    // raw binary values round-trip untouched.
+    let blob = vec![0u8, 159, 146, 150, 255, b'\n'];
+    let idx = kv.set("bin", blob.clone()).await.unwrap();
+    let (index, item) = kv.get_one("bin", idx).await.unwrap();
+    assert_eq!(index, idx);
+    let item = item.unwrap();
+    assert_eq!(item.value.as_slice(), &blob[..]);
+    assert_eq!(item.write_index, idx);
+    assert_eq!(root.node.store.version_of(b"bin").unwrap(), idx);
+
+    // Typed errors.
+    let stale = Txn {
+        checks: vec![Check {
+            key: "bin".into(),
+            index: 0,
+        }],
+        ops: vec![Op::Delete { key: "bin".into() }],
+    };
+    assert!(
+        matches!(kv.txn(stale).await, Err(ClientError::Conflict { actual, .. }) if actual == idx)
+    );
+    assert!(matches!(
+        kv.get_one("bin", 999).await,
+        Err(ClientError::Timeout { wanted: 999, .. })
+    ));
+
+    kv.set("cfg/a", "1").await.unwrap();
+    let last = kv.set("cfg/b", "2").await.unwrap();
+    let (_, items) = kv.scan("cfg/", None, 10, last).await.unwrap();
+    let keys: Vec<_> = items.iter().map(|(k, _)| k.as_slice()).collect();
+    assert_eq!(keys, [&b"cfg/a"[..], b"cfg/b"]);
+    let del = kv.delete("cfg/a").await.unwrap();
+    assert_eq!(kv.get_one("cfg/a", del).await.unwrap().1, None);
+    assert_eq!(kv.status().await.unwrap().applied_index, del);
+
+    // Garbage gets an error frame without killing the connection, and
+    // requests can be pipelined.
+    let stream = tokio::net::UnixStream::connect(&sock).await.unwrap();
+    let mut raw = Framed::new(stream, kvdist::protocol::codec());
+    SinkExt::<bytes::Bytes>::send(&mut raw, bytes::Bytes::from_static(&[0xff, 0xff, 0xff]))
+        .await
+        .unwrap();
+    let get = LocalReq::Get {
+        keys: vec![serde_bytes::ByteBuf::from(&b"cfg/b"[..])],
+        min_index: 0,
+    };
+    for _ in 0..2 {
+        SinkExt::<bytes::Bytes>::send(&mut raw, postcard::to_allocvec(&get).unwrap().into())
+            .await
+            .unwrap();
+    }
+    let mut replies = Vec::new();
+    for _ in 0..3 {
+        let frame = raw.next().await.unwrap().unwrap();
+        replies.push(postcard::from_bytes::<LocalResp>(&frame).unwrap());
+    }
+    assert!(matches!(
+        replies[0],
+        LocalResp::Error(ClientError::BadRequest(_))
+    ));
+    for r in &replies[1..] {
+        match r {
+            LocalResp::Values { items, .. } => {
+                assert_eq!(items[0].as_ref().unwrap().value.as_slice(), b"2")
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    rep.shutdown().await;
+    assert!(!sock.exists());
+    root.shutdown().await;
+}

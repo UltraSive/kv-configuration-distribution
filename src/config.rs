@@ -1,7 +1,7 @@
 use clap::{Parser, ValueEnum};
 use std::path::PathBuf;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
     /// The single write aggregator. Assigns indexes and owns the DbId.

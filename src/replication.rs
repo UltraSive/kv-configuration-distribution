@@ -322,7 +322,7 @@ async fn send_heartbeat(node: &Node, conn: &mut Conn) -> Result<()> {
 }
 
 async fn serve_rpc(node: &Arc<Node>, mut conn: Conn) -> Result<()> {
-    while let Some(req) = protocol::recv::<RpcReq>(&mut conn).await? {
+    while let Some(req) = protocol::recv::<_, RpcReq>(&mut conn).await? {
         let resp = handle_rpc(node, req).await;
         protocol::send(&mut conn, &resp).await?;
     }
@@ -461,7 +461,7 @@ async fn follow_once(node: &Arc<Node>, addr: &str) -> Result<()> {
     loop {
         let msg = match queued.take() {
             Some(m) => m,
-            None => match timeout(IDLE_TIMEOUT, protocol::recv::<Down>(&mut conn)).await {
+            None => match timeout(IDLE_TIMEOUT, protocol::recv::<_, Down>(&mut conn)).await {
                 Err(_) => return Err(Error::Protocol("upstream idle; no heartbeat".into())),
                 Ok(r) => r?.ok_or_else(|| Error::Protocol("upstream closed".into()))?,
             },

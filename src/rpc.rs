@@ -85,7 +85,7 @@ impl RpcPool {
         };
         let res = timeout(CALL_TIMEOUT, async {
             protocol::send(&mut conn, req).await?;
-            protocol::recv::<RpcResp>(&mut conn)
+            protocol::recv::<_, RpcResp>(&mut conn)
                 .await?
                 .ok_or_else(|| Error::Protocol("connection closed".into()))
         })

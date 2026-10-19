@@ -9,7 +9,7 @@ use crate::protocol::{RpcReq, RpcResp};
 use crate::rpc::{CallError, RpcPool};
 use crate::store::Store;
 use crate::types::*;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -76,7 +76,7 @@ pub struct ProxyState {
     pub replicas: RpcPool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Status {
     pub role: Role,
     pub node_id: String,

@@ -9,6 +9,7 @@ use crate::types::*;
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_bytes::ByteBuf;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
@@ -134,21 +135,34 @@ pub enum RpcResp {
 
 pub type Conn = Framed<TcpStream, LengthDelimitedCodec>;
 
-pub fn framed(stream: TcpStream) -> Conn {
-    let _ = stream.set_nodelay(true);
-    let codec = LengthDelimitedCodec::builder()
+/// Frames are a 4-byte big-endian length followed by a postcard message.
+/// Used for both peer TCP connections and the local Unix socket.
+pub fn codec() -> LengthDelimitedCodec {
+    LengthDelimitedCodec::builder()
         .max_frame_length(MAX_FRAME)
-        .new_codec();
-    Framed::new(stream, codec)
+        .new_codec()
 }
 
-pub async fn send<T: Serialize>(conn: &mut Conn, msg: &T) -> Result<()> {
+pub fn framed(stream: TcpStream) -> Conn {
+    let _ = stream.set_nodelay(true);
+    Framed::new(stream, codec())
+}
+
+pub async fn send<S, T>(conn: &mut Framed<S, LengthDelimitedCodec>, msg: &T) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    T: Serialize,
+{
     let bytes = postcard::to_allocvec(msg)?;
     conn.send(bytes::Bytes::from(bytes)).await?;
     Ok(())
 }
 
-pub async fn recv<T: DeserializeOwned>(conn: &mut Conn) -> Result<Option<T>> {
+pub async fn recv<S, T>(conn: &mut Framed<S, LengthDelimitedCodec>) -> Result<Option<T>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    T: DeserializeOwned,
+{
     match conn.next().await {
         None => Ok(None),
         Some(Ok(frame)) => Ok(Some(postcard::from_bytes(&frame)?)),

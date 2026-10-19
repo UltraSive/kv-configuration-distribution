@@ -1,5 +1,5 @@
-//! Client-facing APIs: HTTP (REST + JSON query) and a local Unix socket
-//! speaking length-prefixed JSON frames.
+//! Client-facing HTTP API: REST plus a JSON query endpoint. The local
+//! Unix socket speaks postcard instead; see [`crate::socket`].
 
 use crate::error::WriteError;
 use crate::node::{Node, NodeError, ReadOpts};
@@ -18,10 +18,6 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixListener;
-use tokio_util::sync::CancellationToken;
-use tokio_util::task::TaskTracker;
 
 pub const INDEX_HEADER: &str = "x-kv-index";
 pub const WRITE_INDEX_HEADER: &str = "x-kv-write-index";
@@ -505,58 +501,4 @@ async fn metrics(State(node): State<Arc<Node>>) -> impl IntoResponse {
         line(name, "counter", c.load(Ordering::Relaxed));
     }
     ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], out)
-}
-
-// ---- Unix socket -------------------------------------------------------------
-
-const MAX_SOCKET_FRAME: usize = 64 << 20;
-
-/// Frames are a 4-byte big-endian length followed by a JSON [`ClientQuery`].
-/// Replies are `{"ok": true, "result": ...}` or `{"ok": false, "error": ...}`.
-pub async fn serve_socket(
-    node: Arc<Node>,
-    listener: UnixListener,
-    cancel: CancellationToken,
-    tracker: TaskTracker,
-) {
-    loop {
-        let (mut stream, _) = tokio::select! {
-            _ = cancel.cancelled() => return,
-            r = listener.accept() => match r {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!("socket accept failed: {e}");
-                    continue;
-                }
-            },
-        };
-        let node = node.clone();
-        let cancel = cancel.clone();
-        tracker.spawn(async move {
-            let work = async {
-                loop {
-                    let len = stream.read_u32().await? as usize;
-                    if len > MAX_SOCKET_FRAME {
-                        return Err(std::io::Error::other("frame too large"));
-                    }
-                    let mut buf = vec![0; len];
-                    stream.read_exact(&mut buf).await?;
-                    let reply = match serde_json::from_slice::<ClientQuery>(&buf) {
-                        Err(e) => json!({"ok": false, "error": {"error": e.to_string(), "kind": "bad_request"}}),
-                        Ok(q) => match run_query(&node, q).await {
-                            Ok(result) => json!({"ok": true, "result": result}),
-                            Err(e) => json!({"ok": false, "error": error_json(&e).1}),
-                        },
-                    };
-                    let out = serde_json::to_vec(&reply)?;
-                    stream.write_u32(out.len() as u32).await?;
-                    stream.write_all(&out).await?;
-                }
-            };
-            tokio::select! {
-                _ = cancel.cancelled() => {}
-                r = work => { let _: std::io::Result<()> = r; }
-            }
-        });
-    }
 }

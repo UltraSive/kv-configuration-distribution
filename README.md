@@ -116,7 +116,7 @@ curl -i      localhost:8082/v1/kv/service/ttl?min_index=2        # x-kv-index, x
 curl -X DELETE localhost:8080/v1/kv/service/ttl
 ```
 
-JSON queries (`POST /v1/query`). The Unix socket accepts the same bodies:
+JSON queries (`POST /v1/query`):
 
 ```bash
 # Atomic multi-key transaction with checks
@@ -153,8 +153,52 @@ Errors are JSON with a `kind`: `conflict` (409), `bad_request` (400),
 
 ## Unix socket
 
-Frames are a 4-byte big-endian length followed by a JSON body, the same shape as
-`/v1/query`. Replies are `{"ok":true,"result":...}` or `{"ok":false,"error":{...}}`.
+The fast path for services on the same machine. Start a node with
+`--socket /run/kvdist.sock`. The socket is created with mode `0660`, so
+access goes by Unix user and group.
+
+**Wire format.** Each frame is a 4-byte big-endian length followed by a
+[postcard]-encoded `LocalReq`. Every request gets exactly one `LocalResp`
+frame, in order, so a client can pipeline requests on one connection. Keys and
+values are raw bytes, with no JSON or base64 re-encoding. The message types
+are in `src/socket.rs`.
+
+```rust
+enum LocalReq  { Get { keys, min_index }, Scan { prefix, after, limit, min_index },
+                 Txn { txn, wait }, Status }
+enum LocalResp { Values { index, items: Vec<Option<Item>> }, Scanned { index, items },
+                 Committed { index }, Status(Status), Error(ClientError) }
+```
+
+Errors are typed (`Conflict`, `Timeout`, `Unavailable`, `UnknownOutcome`, ...).
+A frame that can't be decoded gets an `Error(BadRequest)` reply and the
+connection stays open. New message variants are only ever appended, so older
+clients keep working.
+
+**Rust client** (`kvdist::client::LocalClient`):
+
+```rust
+let mut kv = LocalClient::connect("/run/kvdist.sock").await?;
+let index = kv.set("service/ttl", "300").await?;
+let (_, item) = kv.get_one("service/ttl", index).await?; // read-your-writes
+```
+
+**CLI** (`kvctl`, uses `KV_SOCKET`):
+
+```bash
+kvctl set service/ttl 300            # prints the commit index
+printf '\x00\xff' | kvctl set blob -  # value from stdin
+kvctl get service/ttl                # raw value; exit 1 if absent
+kvctl --min-index 42 get service/ttl # wait until this node has index 42
+kvctl scan service/                  # key<TAB>value lines
+kvctl status
+```
+
+Clients in other languages need a postcard implementation; the format is
+[specified](https://postcard.jamesmunns.com/wire-format) and easy to write.
+The HTTP JSON API is still there for anything else.
+
+[postcard]: https://postcard.jamesmunns.com/
 
 ## Layout
 
@@ -166,7 +210,10 @@ src/protocol.rs     peer wire protocol (postcard frames)
 src/replication.rs  upstream server (handshake, snapshot, stream) + follower
 src/rpc.rs          peer RPC pool (proxy reads, write forwarding)
 src/node.rs         per-role read/write paths
-src/api.rs          HTTP + Unix socket
+src/api.rs          HTTP API
+src/socket.rs       Unix socket API (postcard)
+src/client.rs       Unix socket client library
+src/bin/kvctl.rs    socket CLI
 tests/cluster.rs    multi-node tests over real sockets
 ```
 
