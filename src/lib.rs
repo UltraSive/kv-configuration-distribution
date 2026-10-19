@@ -3,6 +3,7 @@
 
 pub mod api;
 pub mod applier;
+pub mod cache;
 pub mod config;
 pub mod error;
 pub mod node;

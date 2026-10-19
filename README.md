@@ -30,7 +30,7 @@ or newer than their own position.
 | Heartbeat from the top of the tree for lag | Root head index and clock relayed down the tree; `lag_entries`, `heartbeat_age_ms` |
 | v1.5 replicas with MVCC (read at index) | `history` keyspace, `(key, superseded_at)` → previous version, pruned by retention |
 | v1.5 proxies with a recent-writes window | Proxy applies the whole log, never evicts keys written in the last `proxy_window` indexes, and fetches misses with `GetAt{at, min}` |
-| Persistent cache with LRU eviction | Proxy cache lives in fjall (survives restarts) with LRU eviction to `proxy_capacity` |
+| Persistent cache; LRU eviction at a disk soft limit, no new keys past a hard limit | Proxy cache lives in fjall (survives restarts) with byte-based soft/hard limits plus free-disk soft/hard limits (see below) |
 | Key/value separation for large values | fjall blob separation on the data keyspace avoids the LMDB fragmentation problem |
 
 Beyond Quicksilver's published design:
@@ -59,6 +59,32 @@ or before `L = max(origin, P - proxy_window)`. The proxy sends
 - a replica ahead of `P` answers from MVCC history *as of `P`*.
 
 Either way the proxy returns exactly the state at index `P`.
+
+## Proxy cache limits
+
+Each cached key counts its key plus record size. The limits work like
+Quicksilver's soft and hard disk limits:
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--proxy-soft-limit` | `1GiB` | Over this, least-recently-used values are evicted back down to it. |
+| `--proxy-hard-limit` | `2GiB` | Once the cache reaches this, values fetched on a miss are served but not cached. |
+| `--proxy-disk-soft-free` | `0` (off) | Free space on the data disk below this also triggers eviction, 5% per pass. |
+| `--proxy-disk-hard-free` | `0` (off) | Free space below this also stops caching fetched values. |
+
+Sizes accept `4096`, `512MiB`, `2GB`, `1.5G` and so on.
+
+Two kinds of data ignore the limits, because consistency depends on them:
+
+- Every write in the log is still applied.
+- Keys written within the last `--proxy-window` indexes are never evicted.
+
+So size the soft limit well above what one window of writes takes up.
+Evicted data is deleted from the LSM straight away, but the disk space only
+comes back after compaction.
+
+`/v1/status` and `/metrics` report `cache_bytes`, `cached_keys`,
+`cache_evictions_total`, `cache_rejected_fills_total` and `disk_free_bytes`.
 
 ## Running
 

@@ -1,7 +1,8 @@
 //! A running node: storage, the single writer, and the read/write paths
 //! for each role.
 
-use crate::applier::{Applier, ApplierConfig, Lru};
+use crate::applier::{Applier, ApplierConfig};
+use crate::cache::{CacheIndex, CacheLimits, SharedCache, free_disk_bytes};
 use crate::config::{Config, Role};
 use crate::error::WriteError;
 use crate::protocol::{RpcReq, RpcResp};
@@ -71,7 +72,7 @@ pub struct Heartbeat {
 }
 
 pub struct ProxyState {
-    pub lru: Lru,
+    pub cache: SharedCache,
     pub replicas: RpcPool,
 }
 
@@ -90,6 +91,12 @@ pub struct Status {
     pub heartbeat_age_ms: Option<u64>,
     pub upstream: Option<String>,
     pub cached_keys: Option<usize>,
+    pub cache_bytes: Option<u64>,
+    pub cache_soft_limit: Option<u64>,
+    pub cache_hard_limit: Option<u64>,
+    pub cache_evictions: Option<u64>,
+    pub cache_rejected_fills: Option<u64>,
+    pub disk_free_bytes: Option<u64>,
 }
 
 pub struct Node {
@@ -117,12 +124,12 @@ impl Node {
             let id = store.init_root()?;
             tracing::info!("root database {id}");
         }
-        let lru: Option<Lru> = (cfg.role == Role::Proxy).then(|| {
-            let mut lru = lru::LruCache::unbounded();
-            for k in store.data_keys().flatten() {
-                lru.put(k, ());
+        let cache: Option<SharedCache> = (cfg.role == Role::Proxy).then(|| {
+            let mut cache = CacheIndex::new();
+            for (k, size) in store.data_sizes().flatten() {
+                cache.upsert(k, size);
             }
-            Arc::new(Mutex::new(lru))
+            Arc::new(Mutex::new(cache))
         });
         let acfg = ApplierConfig {
             role: cfg.role,
@@ -130,14 +137,20 @@ impl Node {
             log_retention: cfg.log_retention,
             history_window: cfg.history_window,
             proxy_window: cfg.proxy_window,
-            proxy_capacity: cfg.proxy_capacity,
+            cache_limits: CacheLimits {
+                data_dir: cfg.data_dir.clone(),
+                soft_bytes: cfg.proxy_soft_limit,
+                hard_bytes: cfg.proxy_hard_limit,
+                disk_soft_free: cfg.proxy_disk_soft_free,
+                disk_hard_free: cfg.proxy_disk_hard_free,
+            },
             max_value_bytes: cfg.max_value_bytes,
             max_txn_ops: cfg.max_txn_ops,
         };
-        let (applier, applied, join) = Applier::spawn(store.clone(), acfg, lru.clone())?;
+        let (applier, applied, join) = Applier::spawn(store.clone(), acfg, cache.clone())?;
         let node_id = store.node_id();
-        let proxy = lru.map(|lru| ProxyState {
-            lru,
+        let proxy = cache.map(|cache| ProxyState {
+            cache,
             replicas: RpcPool::new(cfg.replicas.clone(), node_id),
         });
         let writes = (cfg.role != Role::Root).then(|| RpcPool::new(cfg.upstreams.clone(), node_id));
@@ -252,10 +265,10 @@ impl Node {
         let hits = (keys.len() - missing.len()) as u64;
         Metrics::inc(&self.metrics.cache_hits, hits);
         {
-            let mut lru = proxy.lru.lock().unwrap();
+            let mut cache = proxy.cache.lock().unwrap();
             for (k, r) in keys.iter().zip(records.iter()) {
                 if r.is_some() {
-                    lru.promote(k);
+                    cache.touch(k);
                 }
             }
         }
@@ -383,6 +396,11 @@ impl Node {
         let st = self.store.state();
         let hb = self.heartbeat();
         let root_index = hb.received.map(|_| hb.root_index);
+        let cache = self.proxy.as_ref().map(|p| {
+            let c = p.cache.lock().unwrap();
+            (c.len(), c.bytes(), c.evictions, c.rejected_fills)
+        });
+        let is_proxy = cache.is_some();
         Status {
             role: self.role(),
             node_id: self.store.node_id().to_string(),
@@ -396,7 +414,13 @@ impl Node {
             lag_entries: root_index.map(|r| r.saturating_sub(st.applied)),
             heartbeat_age_ms: hb.received.map(|t| t.elapsed().as_millis() as u64),
             upstream: self.upstream.lock().unwrap().clone(),
-            cached_keys: self.proxy.as_ref().map(|p| p.lru.lock().unwrap().len()),
+            cached_keys: cache.map(|c| c.0),
+            cache_bytes: cache.map(|c| c.1),
+            cache_soft_limit: is_proxy.then_some(self.cfg.proxy_soft_limit),
+            cache_hard_limit: is_proxy.then_some(self.cfg.proxy_hard_limit),
+            cache_evictions: cache.map(|c| c.2),
+            cache_rejected_fills: cache.map(|c| c.3),
+            disk_free_bytes: free_disk_bytes(&self.cfg.data_dir),
         }
     }
 }

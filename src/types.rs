@@ -168,6 +168,8 @@ pub struct Record {
 const REC_HEADER: usize = 4 + 8 + 1;
 
 impl Record {
+    pub const HEADER_LEN: usize = REC_HEADER;
+
     /// Layout: `crc32 (4) | index (8) | tag (1) | value`. The CRC covers the
     /// key as well, so a record served under the wrong key is detected.
     pub fn encode(&self, key: &[u8]) -> Vec<u8> {

@@ -1,17 +1,16 @@
 //! The single writer. Every mutation of the store goes through one thread,
 //! which makes ordering, conflict checks and cache-fill races trivial.
 
+use crate::cache::{CacheLimits, SharedCache, entry_size};
 use crate::config::Role;
 use crate::error::{Error, Result, WriteError};
 use crate::store::{ApplyMode, Store};
 use crate::types::*;
 use fjall::PersistMode;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 use tokio::sync::{mpsc, oneshot, watch};
-
-pub type Lru = Arc<Mutex<lru::LruCache<Vec<u8>, ()>>>;
 
 type Reply<T> = oneshot::Sender<T>;
 
@@ -50,7 +49,7 @@ pub struct ApplierConfig {
     pub log_retention: u64,
     pub history_window: u64,
     pub proxy_window: u64,
-    pub proxy_capacity: usize,
+    pub cache_limits: CacheLimits,
     pub max_value_bytes: usize,
     pub max_txn_ops: usize,
 }
@@ -64,14 +63,14 @@ impl Applier {
     pub fn spawn(
         store: Arc<Store>,
         cfg: ApplierConfig,
-        lru: Option<Lru>,
+        cache: Option<SharedCache>,
     ) -> std::io::Result<(Applier, watch::Receiver<Index>, JoinHandle<()>)> {
         let (tx, rx) = mpsc::channel(4096);
         let (applied_tx, applied_rx) = watch::channel(store.state().applied);
         let worker = Worker {
             store,
             cfg,
-            lru,
+            cache,
             applied_tx,
         };
         let handle = std::thread::Builder::new()
@@ -134,7 +133,7 @@ impl Applier {
 struct Worker {
     store: Arc<Store>,
     cfg: ApplierConfig,
-    lru: Option<Lru>,
+    cache: Option<SharedCache>,
     applied_tx: watch::Sender<Index>,
 }
 
@@ -169,8 +168,8 @@ impl Worker {
                     let _ = reply.send(self.apply(&entries));
                 }
                 Cmd::BeginBootstrap { reply } => {
-                    if let Some(lru) = &self.lru {
-                        lru.lock().unwrap().clear();
+                    if let Some(cache) = &self.cache {
+                        cache.lock().unwrap().clear();
                     }
                     let _ = reply.send(self.store.begin_bootstrap());
                     self.publish();
@@ -215,10 +214,16 @@ impl Worker {
         // consistent prefix and the missing tail is re-fetched upstream.
         self.store
             .apply_entries(entries, mode, PersistMode::Buffer)?;
-        if let Some(lru) = &self.lru {
-            let mut lru = lru.lock().unwrap();
+        if let Some(cache) = &self.cache {
+            // Logged writes are always cached, whatever the limits: the
+            // recent-writes window depends on them.
+            let mut cache = cache.lock().unwrap();
             for op in entries.iter().flat_map(|e| &e.ops) {
-                lru.put(op.key().to_vec(), ());
+                let rec = Record {
+                    index: 0,
+                    value: op.value().map(<[u8]>::to_vec),
+                };
+                cache.upsert(op.key().to_vec(), entry_size(op.key(), &rec));
             }
         }
         self.publish();
@@ -334,13 +339,22 @@ impl Worker {
         }
     }
 
+    /// Caches values fetched on a miss, unless over the hard limit.
     fn cache_fill(&self, items: &[(Vec<u8>, Record)]) {
-        let Some(lru) = &self.lru else { return };
+        let Some(cache) = &self.cache else { return };
+        {
+            let mut c = cache.lock().unwrap();
+            if !self.cfg.cache_limits.admits(c.bytes()) {
+                c.rejected_fills += items.len() as u64;
+                return;
+            }
+        }
         match self.store.fill_absent(items) {
             Ok(inserted) => {
-                let mut lru = lru.lock().unwrap();
-                for k in inserted {
-                    lru.put(k, ());
+                let mut c = cache.lock().unwrap();
+                for i in inserted {
+                    let (k, r) = &items[i];
+                    c.upsert(k.clone(), entry_size(k, r));
                 }
             }
             Err(e) => tracing::warn!("cache fill failed: {e}"),
@@ -348,8 +362,8 @@ impl Worker {
     }
 
     fn maintain(&self) {
-        match &self.lru {
-            Some(lru) => self.evict(lru),
+        match &self.cache {
+            Some(cache) => self.evict(cache),
             None => {
                 for _ in 0..8 {
                     match self
@@ -368,33 +382,36 @@ impl Worker {
         }
     }
 
-    /// Evicts least-recently-used keys, but never ones written inside the
-    /// recent-writes window: a proxy relies on "absent locally" meaning "not
-    /// written within the window" to fetch misses consistently.
-    fn evict(&self, lru: &Lru) {
+    /// Evicts least-recently-used keys down to the byte target, but never
+    /// ones written inside the recent-writes window: a proxy relies on
+    /// "absent locally" meaning "not written within the window" to fetch
+    /// misses consistently.
+    fn evict(&self, cache: &SharedCache) {
+        const MAX_PER_PASS: usize = 100_000;
         let floor = self
             .store
             .state()
             .applied
             .saturating_sub(self.cfg.proxy_window);
-        let mut lru = lru.lock().unwrap();
-        let over = lru.len().saturating_sub(self.cfg.proxy_capacity);
-        if over == 0 {
+        let mut c = cache.lock().unwrap();
+        let Some(target) = self.cfg.cache_limits.eviction_target(c.bytes()) else {
             return;
-        }
+        };
         let mut victims = Vec::new();
-        let mut tries = 0;
-        while victims.len() < over && tries < over * 4 + 64 {
-            tries += 1;
-            let Some((k, ())) = lru.pop_lru() else { break };
+        let mut protected = Vec::new();
+        while c.bytes() > target && victims.len() + protected.len() < MAX_PER_PASS {
+            let Some((k, size)) = c.pop_lru() else { break };
             match self.store.get_record(&k) {
-                Ok(Some(r)) if r.index > floor => {
-                    lru.put(k, ());
-                }
+                Ok(Some(r)) if r.index > floor => protected.push((k, size)),
                 Ok(None) => {}
                 _ => victims.push(k),
             }
         }
+        for (k, size) in protected {
+            c.upsert(k, size);
+        }
+        c.evictions += victims.len() as u64;
+        drop(c);
         if let Err(e) = self.store.remove_data(&victims) {
             tracing::warn!("eviction failed: {e}");
         }

@@ -322,14 +322,12 @@ impl Store {
         Ok((index, out))
     }
 
-    pub fn data_keys(&self) -> impl Iterator<Item = Result<Vec<u8>>> + '_ {
-        self.data
-            .iter()
-            .map(|g| g.key().map(|k| k.to_vec()).map_err(Error::from))
-    }
-
-    pub fn cached_len(&self) -> usize {
-        self.data.approximate_len()
+    /// Every key in the data keyspace with the bytes it occupies.
+    pub fn data_sizes(&self) -> impl Iterator<Item = Result<(Vec<u8>, u64)>> + '_ {
+        self.data.iter().map(|g| {
+            let (k, v) = g.into_inner()?;
+            Ok((k.to_vec(), (k.len() + v.len()) as u64))
+        })
     }
 
     fn log_entry(&self, i: Index) -> Result<Option<LogEntry>> {
@@ -520,14 +518,15 @@ impl Store {
         Ok(())
     }
 
-    /// Proxy cache fill: inserts records for keys that are still absent.
-    pub fn fill_absent(&self, items: &[(Vec<u8>, Record)]) -> Result<Vec<Vec<u8>>> {
+    /// Proxy cache fill: inserts records for keys that are still absent and
+    /// returns the positions of the items inserted.
+    pub fn fill_absent(&self, items: &[(Vec<u8>, Record)]) -> Result<Vec<usize>> {
         let mut b = self.batch(PersistMode::Buffer);
         let mut inserted = Vec::new();
-        for (k, r) in items {
+        for (i, (k, r)) in items.iter().enumerate() {
             if self.data.get(k)?.is_none() {
                 b.insert(&self.data, k.clone(), r.encode(k));
-                inserted.push(k.clone());
+                inserted.push(i);
             }
         }
         b.commit()?;

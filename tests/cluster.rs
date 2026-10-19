@@ -292,7 +292,8 @@ async fn proxy_caches_consistently() {
 
     let mut pc = cfg(Role::Proxy, &d3, &[&rep]);
     pc.proxy_window = 5;
-    pc.proxy_capacity = 4;
+    // ~19 bytes per cached key: room for the protected window plus a few more.
+    pc.proxy_soft_limit = 150;
     let proxy = server::start(pc).await.unwrap();
     // Proxies start at the head without a snapshot.
     for _ in 0..100 {
@@ -336,8 +337,13 @@ async fn proxy_caches_consistently() {
             .await
     );
     tokio::time::sleep(Duration::from_millis(2500)).await;
-    let cached = proxy.node.status().cached_keys.unwrap();
-    assert!(cached < 20, "eviction did not run: {cached}");
+    let st = proxy.node.status();
+    assert!(
+        st.cache_bytes.unwrap() <= 150,
+        "eviction did not run: {st:?}"
+    );
+    assert!(st.cached_keys.unwrap() < 20);
+    assert!(st.cache_evictions.unwrap() > 0);
     assert_eq!(read(&proxy, "old3", 0).await.1, Some("new".into()));
     assert_eq!(read(&proxy, "old7", 0).await.1, Some("v".into()));
 
@@ -476,5 +482,49 @@ async fn http_api() {
         .await
         .unwrap();
     assert!(m.contains("kvdist_applied_index 2"));
+    root.shutdown().await;
+}
+
+#[tokio::test]
+async fn proxy_hard_limit_stops_caching_but_still_serves() {
+    let (d1, d2, d3) = (
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    );
+    let root = server::start(cfg(Role::Root, &d1, &[])).await.unwrap();
+    root.node.write(set("cold", "c"), true).await.unwrap();
+    let rep = server::start(cfg(Role::Replica, &d2, &[&root]))
+        .await
+        .unwrap();
+    assert!(rep.node.wait_for(1, Duration::from_secs(10)).await);
+
+    let mut pc = cfg(Role::Proxy, &d3, &[&rep]);
+    pc.proxy_soft_limit = 0;
+    pc.proxy_hard_limit = 0;
+    let proxy = server::start(pc).await.unwrap();
+    for _ in 0..100 {
+        if proxy.node.store.state().db_id.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Over the hard limit: misses are served but never cached.
+    for _ in 0..3 {
+        assert_eq!(read(&proxy, "cold", 0).await.1, Some("c".into()));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let st = proxy.node.status();
+    assert_eq!(proxy.node.metrics.cache_misses.load(Ordering::Relaxed), 3);
+    assert_eq!(st.cache_rejected_fills, Some(3));
+
+    // Logged writes are still applied (the recent-writes window needs them).
+    let idx = root.node.write(set("fresh", "f"), true).await.unwrap();
+    assert_eq!(read(&proxy, "fresh", idx).await.1, Some("f".into()));
+    assert_eq!(proxy.node.metrics.cache_misses.load(Ordering::Relaxed), 3);
+
+    proxy.shutdown().await;
+    rep.shutdown().await;
     root.shutdown().await;
 }

@@ -473,8 +473,22 @@ async fn metrics(State(node): State<Arc<Node>>) -> impl IntoResponse {
     if let Some(a) = s.heartbeat_age_ms {
         line("heartbeat_age_ms", "gauge", a);
     }
-    if let Some(c) = s.cached_keys {
-        line("cached_keys", "gauge", c as u64);
+    for (name, kind, v) in [
+        ("cached_keys", "gauge", s.cached_keys.map(|c| c as u64)),
+        ("cache_bytes", "gauge", s.cache_bytes),
+        ("cache_soft_limit_bytes", "gauge", s.cache_soft_limit),
+        ("cache_hard_limit_bytes", "gauge", s.cache_hard_limit),
+        ("cache_evictions_total", "counter", s.cache_evictions),
+        (
+            "cache_rejected_fills_total",
+            "counter",
+            s.cache_rejected_fills,
+        ),
+        ("disk_free_bytes", "gauge", s.disk_free_bytes),
+    ] {
+        if let Some(v) = v {
+            line(name, kind, v);
+        }
     }
     for (name, c) in [
         ("reads_total", &m.reads),

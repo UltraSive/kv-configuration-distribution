@@ -59,9 +59,25 @@ pub struct Config {
     #[arg(long, env = "KV_PROXY_WINDOW", default_value_t = 10_000)]
     pub proxy_window: u64,
 
-    /// Proxy only: target number of cached keys.
-    #[arg(long, env = "KV_PROXY_CAPACITY", default_value_t = 1_000_000)]
-    pub proxy_capacity: usize,
+    /// Proxy only: evict least-recently-used values while the cache is
+    /// larger than this (e.g. 512MiB, 2GB).
+    #[arg(long, env = "KV_PROXY_SOFT_LIMIT", default_value = "1GiB", value_parser = parse_bytes)]
+    pub proxy_soft_limit: u64,
+
+    /// Proxy only: stop caching values fetched on a miss once the cache
+    /// reaches this size. Reads are still served.
+    #[arg(long, env = "KV_PROXY_HARD_LIMIT", default_value = "2GiB", value_parser = parse_bytes)]
+    pub proxy_hard_limit: u64,
+
+    /// Proxy only: also evict while free space on the data disk is below
+    /// this (0 = off).
+    #[arg(long, env = "KV_PROXY_DISK_SOFT_FREE", default_value = "0", value_parser = parse_bytes)]
+    pub proxy_disk_soft_free: u64,
+
+    /// Proxy only: also stop caching fetched values while free space on the
+    /// data disk is below this (0 = off).
+    #[arg(long, env = "KV_PROXY_DISK_HARD_FREE", default_value = "0", value_parser = parse_bytes)]
+    pub proxy_disk_hard_free: u64,
 
     /// Max transactions group-committed in one batch on the root.
     #[arg(long, env = "KV_MAX_BATCH", default_value_t = 1024)]
@@ -86,6 +102,12 @@ impl Config {
         if self.history_window > self.log_retention {
             return Err("--history-window must not exceed --log-retention".into());
         }
+        if self.proxy_soft_limit > self.proxy_hard_limit {
+            return Err("--proxy-soft-limit must not exceed --proxy-hard-limit".into());
+        }
+        if self.proxy_disk_hard_free > self.proxy_disk_soft_free {
+            return Err("--proxy-disk-hard-free must not exceed --proxy-disk-soft-free".into());
+        }
         if self.role == Role::Proxy && self.replicas.is_empty() {
             self.replicas = self.upstreams.clone();
         }
@@ -98,5 +120,38 @@ impl Config {
         c.role = role;
         c.data_dir = data_dir.into();
         c
+    }
+}
+
+/// Parses sizes like `4096`, `512MiB`, `2GB` or `1.5G` (K/M/G/T are binary).
+pub fn parse_bytes(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    let split = s
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(s.len());
+    let (num, unit) = s.split_at(split);
+    let num: f64 = num.parse().map_err(|_| format!("invalid size {s:?}"))?;
+    let mult: u64 = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "k" | "kb" | "kib" => 1 << 10,
+        "m" | "mb" | "mib" => 1 << 20,
+        "g" | "gb" | "gib" => 1 << 30,
+        "t" | "tb" | "tib" => 1 << 40,
+        u => return Err(format!("unknown size unit {u:?}")),
+    };
+    Ok((num * mult as f64) as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_bytes;
+
+    #[test]
+    fn sizes() {
+        assert_eq!(parse_bytes("4096"), Ok(4096));
+        assert_eq!(parse_bytes("512MiB"), Ok(512 << 20));
+        assert_eq!(parse_bytes("2GB"), Ok(2 << 30));
+        assert_eq!(parse_bytes("1.5g"), Ok(3 << 29));
+        assert!(parse_bytes("lots").is_err());
     }
 }
