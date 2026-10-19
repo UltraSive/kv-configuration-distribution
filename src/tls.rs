@@ -124,7 +124,11 @@ pub fn peer_names(cert: &CertificateDer<'_>) -> Vec<String> {
             }
         }
     }
+    // A name is often both the common name and a subjectAltName.
+    names.sort();
+    names.dedup();
     names
+
 }
 
 /// The name a peer's certificate must match: the host part of `host:port`.
