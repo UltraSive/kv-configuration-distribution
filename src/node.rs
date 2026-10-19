@@ -15,7 +15,7 @@ use crate::types::*;
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -120,6 +120,9 @@ pub struct Node {
     pub metrics: Metrics,
     /// Applied entries, for watchers.
     pub feed: Arc<Feed>,
+    /// Set when the upstream has another database or a diverged log and
+    /// --resync is on: the next connection asks for a snapshot.
+    pub resync: AtomicBool,
 }
 
 pub struct ReadOpts {
@@ -182,8 +185,22 @@ impl Node {
             tokens,
             metrics: Metrics::default(),
             feed,
+            resync: AtomicBool::new(false),
         };
         Ok((Arc::new(node), join))
+    }
+
+    /// May a peer with these certificate names (`None`: no mTLS) send writes?
+    pub fn peer_may_write(&self, names: Option<&[String]>) -> bool {
+        match names {
+            // Without mTLS no peer is identified; startup warns about it.
+            None => true,
+            Some(names) => self
+                .cfg
+                .peer_writers
+                .iter()
+                .any(|w| w == "*" || names.contains(w)),
+        }
     }
 
     pub fn role(&self) -> Role {

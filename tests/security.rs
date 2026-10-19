@@ -1,7 +1,9 @@
 //! mTLS between nodes, HTTPS, bearer tokens and the HTTP Unix socket.
 
 use kvdist::config::{Config, Role};
-use kvdist::node::ReadOpts;
+use kvdist::error::WriteError;
+use kvdist::node::{NodeError, ReadOpts};
+
 use kvdist::server::{self, Running};
 use kvdist::types::{Op, Txn};
 use rcgen::{
@@ -88,20 +90,21 @@ async fn mutual_tls_between_nodes() {
     let rogue_ca = make_ca(pki.path(), "rogue-ca");
     let dirs: Vec<TempDir> = (0..5).map(|_| TempDir::new().unwrap()).collect();
 
-    let root = server::start(with_tls(
+    let mut root_cfg = with_tls(
         cfg(Role::Root, &dirs[0], &[]),
         issue(pki.path(), &ca, "root"),
         &ca.pem,
-    ))
-    .await
-    .unwrap();
+    );
+    root_cfg.peer_writers = vec!["rep".into()];
+    let root = server::start(root_cfg).await.unwrap();
     let idx = root.node.write(set("secret", "s3"), true).await.unwrap();
 
-    let rep_cfg = with_tls(
+    let mut rep_cfg = with_tls(
         cfg(Role::Replica, &dirs[1], &[&root]),
         issue(pki.path(), &ca, "rep"),
         &ca.pem,
     );
+    rep_cfg.peer_writers = vec!["proxy".into()];
     let rep = server::start(rep_cfg).await.unwrap();
     let proxy_cfg = with_tls(
         cfg(Role::Proxy, &dirs[2], &[&rep]),
@@ -158,6 +161,68 @@ async fn mutual_tls_between_nodes() {
     }
 
     for n in [plain, rogue, proxy, rep, root] {
+        n.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn only_listed_peers_may_write() {
+    let pki = TempDir::new().unwrap();
+    let ca = make_ca(pki.path(), "cluster-ca");
+    let dirs: Vec<TempDir> = (0..3).map(|_| TempDir::new().unwrap()).collect();
+
+    let mut root_cfg = with_tls(
+        cfg(Role::Root, &dirs[0], &[]),
+        issue(pki.path(), &ca, "root"),
+        &ca.pem,
+    );
+    root_cfg.peer_writers = vec!["writer".into()];
+    let root = server::start(root_cfg).await.unwrap();
+    let writer = server::start(with_tls(
+        cfg(Role::Replica, &dirs[1], &[&root]),
+        issue(pki.path(), &ca, "writer"),
+        &ca.pem,
+    ))
+    .await
+    .unwrap();
+    let reader = server::start(with_tls(
+        cfg(Role::Replica, &dirs[2], &[&root]),
+        issue(pki.path(), &ca, "reader"),
+        &ca.pem,
+    ))
+    .await
+    .unwrap();
+
+    // A peer that isn't a writer is refused, and nothing is committed...
+    let err = reader
+        .node
+        .write(set("k", "nope"), false)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, NodeError::Write(WriteError::Forbidden(_))),
+        "{err:?}"
+    );
+    assert_eq!(root.node.applied(), 0);
+    // ...but it still replicates what a writer writes.
+    let idx = writer.node.write(set("k", "yes"), true).await.unwrap();
+    let (_, recs) = reader
+        .node
+        .get(
+            vec![b"k".to_vec()],
+            ReadOpts {
+                min_index: idx,
+                wait: Duration::from_secs(10),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        recs[0].as_ref().unwrap().value.as_deref(),
+        Some(&b"yes"[..])
+    );
+
+    for n in [reader, writer, root] {
         n.shutdown().await;
     }
 }

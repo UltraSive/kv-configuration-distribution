@@ -397,6 +397,47 @@ async fn rejects_foreign_database_and_self_replication() {
 }
 
 #[tokio::test]
+async fn resync_follows_a_rebuilt_root() {
+    let dirs: Vec<TempDir> = (0..4).map(|_| TempDir::new().unwrap()).collect();
+    let old_root = server::start(cfg(Role::Root, &dirs[0], &[])).await.unwrap();
+    let new_root = server::start(cfg(Role::Root, &dirs[1], &[])).await.unwrap();
+    let i = old_root.node.write(set("a", "old"), true).await.unwrap();
+    old_root.node.write(set("gone", "x"), true).await.unwrap();
+    new_root.node.write(set("a", "new"), true).await.unwrap();
+
+    // root -> replica -> leaf, both allowed to resync; the new root is the
+    // replica's second upstream.
+    let mut c = cfg(Role::Replica, &dirs[2], &[&old_root, &new_root]);
+    c.resync = true;
+    let rep = server::start(c).await.unwrap();
+    let mut c = cfg(Role::Replica, &dirs[3], &[&rep]);
+    c.resync = true;
+    let leaf = server::start(c).await.unwrap();
+    assert_eq!(read(&leaf, "a", i + 1).await.1, Some("old".into()));
+
+    // The old root goes away: the replica fails over to the new one, finds
+    // another database and takes its snapshot; the leaf follows.
+    old_root.shutdown().await;
+    let new_db = new_root.node.store.state().db_id;
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while leaf.node.store.state().db_id != new_db {
+        assert!(std::time::Instant::now() < deadline, "leaf never resynced");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(rep.node.store.state().db_id, new_db);
+    assert_eq!(read(&leaf, "a", 0).await.1, Some("new".into()));
+    assert_eq!(read(&leaf, "gone", 0).await.1, None);
+
+    // And keeps following it.
+    let i = new_root.node.write(set("a", "newer"), true).await.unwrap();
+    assert_eq!(read(&leaf, "a", i).await.1, Some("newer".into()));
+
+    leaf.shutdown().await;
+    rep.shutdown().await;
+    new_root.shutdown().await;
+}
+
+#[tokio::test]
 async fn http_api() {
     let dir = TempDir::new().unwrap();
     let root = server::start(cfg(Role::Root, &dir, &[])).await.unwrap();

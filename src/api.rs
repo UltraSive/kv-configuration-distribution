@@ -259,7 +259,7 @@ pub fn error_json(e: &NodeError) -> (StatusCode, Value) {
             StatusCode::GATEWAY_TIMEOUT,
             json!({"error": msg, "kind": "timeout", "index": index, "wanted": wanted}),
         ),
-        NodeError::Forbidden(_) => (
+        NodeError::Forbidden(_) | NodeError::Write(WriteError::Forbidden(_)) => (
             StatusCode::FORBIDDEN,
             json!({"error": msg, "kind": "forbidden"}),
         ),

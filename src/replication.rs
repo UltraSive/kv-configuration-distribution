@@ -18,6 +18,7 @@ use futures::FutureExt;
 use futures::StreamExt;
 use serde_bytes::ByteBuf;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
@@ -69,13 +70,19 @@ pub async fn serve(
 }
 
 async fn handle_conn(node: Arc<Node>, stream: TcpStream) -> Result<()> {
-    let mut conn = protocol::accept(stream, node.tls.peer_acceptor.as_ref()).await?;
+    let (mut conn, names) = protocol::accept(stream, node.tls.peer_acceptor.as_ref()).await?;
     let hello: Hello = timeout(IDLE_TIMEOUT, protocol::recv(&mut conn))
         .await
         .map_err(|_| Error::Protocol("no hello".into()))??
         .ok_or_else(|| Error::Protocol("closed before hello".into()))?;
     match hello {
-        Hello::Rpc { proto, .. } if proto == PROTOCOL_VERSION => serve_rpc(&node, conn).await,
+        Hello::Rpc { proto, .. } if proto == PROTOCOL_VERSION => {
+            let writer = node
+                .peer_may_write(names.as_deref())
+                .then_some(())
+                .ok_or_else(|| names.unwrap_or_default().join(", "));
+            serve_rpc(&node, conn, writer).await
+        }
         Hello::Replicate {
             proto,
             node_id,
@@ -271,8 +278,14 @@ async fn stream_log(node: &Arc<Node>, mut conn: Conn, mut next: Index) -> Result
     let mut applied = node.applied_watch();
     let mut ticker = interval(HEARTBEAT);
     let mut last_hb = Instant::now();
+    let db_id = node.store.state().db_id;
     loop {
         let st = node.store.state();
+        if st.db_id != db_id {
+            // This node took a snapshot of another database (--resync): the
+            // downstream reconnects and finds out.
+            return Err(Error::Protocol("database replaced; closing stream".into()));
+        }
         if next < st.log_floor {
             return reject(
                 &mut conn,
@@ -321,9 +334,24 @@ async fn send_heartbeat(node: &Node, conn: &mut Conn) -> Result<()> {
     .await
 }
 
-async fn serve_rpc(node: &Arc<Node>, mut conn: Conn) -> Result<()> {
+/// Serves a peer's RPCs. `writer` is `Err(its names)` if it may not write.
+async fn serve_rpc(
+    node: &Arc<Node>,
+    mut conn: Conn,
+    writer: std::result::Result<(), String>,
+) -> Result<()> {
     while let Some(req) = protocol::recv::<_, RpcReq>(&mut conn).await? {
-        let resp = handle_rpc(node, req).await;
+        let resp = match (&req, &writer) {
+            (RpcReq::Write { .. }, Err(names)) => {
+                tracing::warn!("refused a write from peer [{names}]: not a --peer-writer");
+                RpcResp::WriteFailed {
+                    error: crate::error::WriteError::Forbidden(format!(
+                        "peer [{names}] may not write here"
+                    )),
+                }
+            }
+            _ => handle_rpc(node, req).await,
+        };
         protocol::send(&mut conn, &resp).await?;
     }
     Ok(())
@@ -439,16 +467,24 @@ async fn follow_once(node: &Arc<Node>, addr: &str) -> Result<()> {
     let mut conn = protocol::connect(addr, tls, Duration::from_secs(3)).await?;
     let st = node.store.state();
     let is_proxy = node.role() == Role::Proxy;
+    // Resyncing: present as a new node, so the upstream sends a snapshot (or,
+    // to a proxy, its head).
+    let resync = node.resync.load(Ordering::Relaxed);
+    let (db, last_index, last_hash) = if resync {
+        (None, 0, GENESIS_HASH)
+    } else {
+        (st.db_id, st.applied, st.hash)
+    };
     protocol::send(
         &mut conn,
         &Hello::Replicate {
             proto: PROTOCOL_VERSION,
             node_id: node.store.node_id(),
-            db_id: st.db_id,
-            last_index: st.applied,
-            last_hash: st.hash,
+            db_id: db,
+            last_index,
+            last_hash,
             allow_snapshot: !is_proxy,
-            newest_only: is_proxy && st.db_id.is_none(),
+            newest_only: is_proxy && db.is_none(),
         },
     )
     .await?;
@@ -478,6 +514,15 @@ async fn follow_once(node: &Arc<Node>, addr: &str) -> Result<()> {
                 *node.upstream.lock().unwrap() = Some(addr.to_string());
             }
             Down::Rejected { reason, message } => {
+                if node.cfg.resync
+                    && matches!(reason, RejectReason::DbMismatch | RejectReason::Diverged)
+                {
+                    tracing::warn!(
+                        "upstream {addr} has another history ({message}); \
+                         replacing local data with its snapshot (--resync)"
+                    );
+                    node.resync.store(true, Ordering::Relaxed);
+                }
                 if is_proxy && reason == RejectReason::Gap {
                     // A proxy can't take a snapshot; drop the cache and restart from the head.
                     tracing::warn!("proxy fell behind upstream log; resetting cache");
@@ -508,14 +553,16 @@ async fn follow_once(node: &Arc<Node>, addr: &str) -> Result<()> {
                     .ok_or_else(|| Error::Protocol("snapshot end without begin".into()))?;
                 let id = db_id.ok_or_else(|| Error::Protocol("snapshot before welcome".into()))?;
                 node.applier.finish_bootstrap(id, index, hash).await?;
+                node.resync.store(false, Ordering::Relaxed);
                 Metrics::inc(&node.metrics.snapshots_installed, 1);
                 tracing::info!("snapshot installed at index {index}");
             }
             Down::StartAt { index, hash } => {
                 let id = db_id.ok_or_else(|| Error::Protocol("start before welcome".into()))?;
-                if node.store.state().db_id.is_none() {
+                if resync || node.store.state().db_id.is_none() {
                     node.applier.begin_bootstrap().await?;
                     node.applier.finish_bootstrap(id, index, hash).await?;
+                    node.resync.store(false, Ordering::Relaxed);
                 }
             }
             Down::Entries { mut entries } => {

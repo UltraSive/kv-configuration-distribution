@@ -298,6 +298,43 @@ curl --cacert ca.crt -H "authorization: Bearer $READ_TOKEN" https://node:8080/v1
 A write sent to a replica or proxy is authorized by that node's token file,
 then forwarded over mTLS. Keep token files consistent across the cluster.
 
+**Which peers may write.** With mTLS, a node only accepts writes forwarded
+by the peers listed in `--peer-writer` (`KV_PEER_WRITERS`, comma-separated),
+matched against a DNS subjectAltName or the common name in their
+certificate; `*` allows any. With none listed, a node takes writes only from
+its own clients (HTTP and sockets), so by default nothing can write through
+a replica or proxy. Every node in the chain checks the peer it hears from:
+for writes from a proxy through a replica to the root, the replica lists the
+proxy and the root lists the replica. A refused write fails with
+`forbidden` (`403` over HTTP) and is never committed. Replication and reads
+are open to every node with a cluster certificate.
+
+```bash
+# Root: only the deploy replica may forward writes; edge nodes just read.
+kvdist --role root --tls-ca ca.crt ... --peer-writer deploy-1.internal
+```
+
+Without `--tls-ca` peers aren't identified, so `--peer-writer` is refused
+and any peer may write.
+
+## Rebuilding the root
+
+There's one root, so if it's lost, start a new one with an empty data dir.
+It gets a new database id, and followers refuse it until they're started
+with `--resync` (`KV_RESYNC=true`). With it, a follower whose upstream has a
+different database, or a log that diverges from its own, drops its data and
+takes the upstream's snapshot (a proxy restarts from the upstream's head),
+and closes its own downstream streams so they follow. Watchers get
+`Resync`. Without it, the follower keeps serving its data and refuses the
+upstream, as before.
+
+Use it where the data can be rewritten from elsewhere (it's a copy of a
+database, say), and give a node only upstreams of one tree: a follower
+that alternates between two databases re-snapshots every time it switches.
+A root restored from an older backup keeps its database id but is behind
+its followers, which wait for it rather than resync; start a new database
+instead.
+
 **HTTP over a Unix socket.** `--http-socket /run/kvdist-http.sock` serves the
 same HTTP API locally, with no TCP and no TLS. This suits non-Rust local
 clients that would rather not speak postcard:
@@ -330,10 +367,11 @@ tests/watch.rs      watching prefixes over the socket
 
 ## Not (yet) implemented
 
-- Any node with a cluster-CA certificate is fully trusted: it can replicate
-  everything and submit writes. There are no per-node permissions.
+- Any node with a cluster-CA certificate can replicate everything; only
+  writes are limited per peer (`--peer-writer`).
 - No certificate revocation (CRLs/OCSP); rotate the CA to cut a node off.
 - Single root: there's no leader election or root failover.
-- A diverged log (for example a root restored from an old backup) is refused,
-  not repaired automatically. Wipe the replica's data dir to re-bootstrap it.
+- A diverged log or a new database is refused unless the follower runs with
+  `--resync` (see "Rebuilding the root").
+
 - No Quicksilver v2 data-center tier (sharded L2 cache, relays, reactive prefetch).

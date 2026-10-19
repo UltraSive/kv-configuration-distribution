@@ -61,6 +61,19 @@ pub struct Config {
     #[arg(long, env = "KV_AUTH_TOKENS")]
     pub auth_tokens: Option<PathBuf>,
 
+    /// Peers that may send writes over the peer port, by a name in their
+    /// certificate (a DNS subjectAltName or the common name); `*` for any.
+    /// With --tls-ca and none listed, writes only come from this node's own
+    /// clients. Without --tls-ca, peers aren't identified and any may write.
+    #[arg(long = "peer-writer", env = "KV_PEER_WRITERS", value_delimiter = ',')]
+    pub peer_writers: Vec<String>,
+
+    /// When an upstream has a different database, or a log that diverges
+    /// from this node's, replace this node's data with a snapshot of the
+    /// upstream's instead of refusing it. For trees whose root may be rebuilt.
+    #[arg(long, env = "KV_RESYNC")]
+    pub resync: bool,
+
     /// Upstream peers to replicate from, in preference order.
     #[arg(long = "upstream", env = "KV_UPSTREAMS", value_delimiter = ',')]
     pub upstreams: Vec<String>,
@@ -123,6 +136,9 @@ impl Config {
         }
         if self.tls_ca.is_some() && self.tls_cert.is_none() {
             return Err("--tls-ca needs --tls-cert and --tls-key".into());
+        }
+        if !self.peer_writers.is_empty() && self.tls_ca.is_none() {
+            return Err("--peer-writer needs --tls-ca to identify peers".into());
         }
         if self.role != Role::Root && self.upstreams.is_empty() {
             return Err("replica and proxy nodes need at least one --upstream".into());

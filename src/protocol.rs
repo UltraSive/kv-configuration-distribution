@@ -214,19 +214,31 @@ pub async fn connect(addr: &str, tls: Option<&TlsConnector>, limit: Duration) ->
         .map_err(|_| Error::Protocol(format!("connect to {addr} timed out")))?
 }
 
-/// Accepts a peer, requiring a client certificate if `tls` is set.
-pub async fn accept(tcp: TcpStream, tls: Option<&TlsAcceptor>) -> Result<Conn> {
+/// Accepts a peer, requiring a client certificate if `tls` is set. Returns
+/// the names its certificate gives it ([`crate::tls::peer_names`]), or `None`
+/// without TLS.
+pub async fn accept(
+    tcp: TcpStream,
+    tls: Option<&TlsAcceptor>,
+) -> Result<(Conn, Option<Vec<String>>)> {
     let _ = tcp.set_nodelay(true);
-    let stream = match tls {
-        None => PeerStream::Plain(tcp),
+    let (stream, names) = match tls {
+        None => (PeerStream::Plain(tcp), None),
         Some(acceptor) => {
             let tls = timeout(Duration::from_secs(10), acceptor.accept(tcp))
                 .await
                 .map_err(|_| Error::Protocol("tls handshake timed out".into()))??;
-            PeerStream::Tls(Box::new(tls.into()))
+            let names = tls
+                .get_ref()
+                .1
+                .peer_certificates()
+                .and_then(<[_]>::first)
+                .map(crate::tls::peer_names)
+                .unwrap_or_default();
+            (PeerStream::Tls(Box::new(tls.into())), Some(names))
         }
     };
-    Ok(Framed::new(stream, codec()))
+    Ok((Framed::new(stream, codec()), names))
 }
 
 pub async fn send<S, T>(conn: &mut Framed<S, LengthDelimitedCodec>, msg: &T) -> Result<()>

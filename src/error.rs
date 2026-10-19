@@ -51,4 +51,7 @@ pub enum WriteError {
     Unknown(String),
     #[error("storage failure: {0}")]
     Storage(String),
+    /// The sending peer isn't allowed to write (--peer-writer).
+    #[error("write forbidden: {0}")]
+    Forbidden(String),
 }

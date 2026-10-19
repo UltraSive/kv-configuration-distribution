@@ -105,6 +105,28 @@ impl TlsSettings {
     }
 }
 
+/// The names a peer's certificate identifies it by, for --peer-writer: its
+/// DNS subjectAltNames and common name.
+pub fn peer_names(cert: &CertificateDer<'_>) -> Vec<String> {
+    use x509_parser::extensions::GeneralName;
+    let Ok((_, cert)) = x509_parser::parse_x509_certificate(cert) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = cert
+        .subject()
+        .iter_common_name()
+        .filter_map(|cn| cn.as_str().ok().map(str::to_string))
+        .collect();
+    if let Ok(Some(san)) = cert.subject_alternative_name() {
+        for n in &san.value.general_names {
+            if let GeneralName::DNSName(d) = n {
+                names.push(d.to_string());
+            }
+        }
+    }
+    names
+}
+
 /// The name a peer's certificate must match: the host part of `host:port`.
 pub fn server_name(addr: &str) -> anyhow::Result<ServerName<'static>> {
     let host = addr.rsplit_once(':').map_or(addr, |(h, _)| h);

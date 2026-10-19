@@ -87,7 +87,10 @@ pub async fn start(mut cfg: Config) -> anyhow::Result<Running> {
     }
     if cfg.tls_ca.is_none() && (peer_addr.is_some() || cfg.role != Role::Root) {
         tracing::warn!("peer connections are unencrypted and unauthenticated; set --tls-ca");
+    } else if peer_addr.is_some() && !cfg.peer_writers.is_empty() {
+        tracing::info!("peers that may write: {}", cfg.peer_writers.join(", "));
     }
+
     tracing::info!(
         "{:?} node {} serving {} on {http_addr}{}",
         cfg.role,

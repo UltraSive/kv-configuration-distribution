@@ -166,7 +166,9 @@ impl From<NodeError> for ClientError {
             NodeError::Timeout { index, wanted } => ClientError::Timeout { index, wanted },
             NodeError::NotReady(m) => ClientError::NotReady(m),
             NodeError::Gone { floor } => ClientError::Gone { floor },
-            NodeError::Forbidden(m) => ClientError::Forbidden(m),
+            NodeError::Forbidden(m) | NodeError::Write(WriteError::Forbidden(m)) => {
+                ClientError::Forbidden(m)
+            }
         }
     }
 }
