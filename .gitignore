@@ -1,21 +1,14 @@
-# RocksDB data directory
+# Build output
+/target
+
+# Local data directories
+/data/
 kvdb/
 
 # OS-specific files
 .DS_Store
 Thumbs.db
 
-# Go build cache & modules
-*.exe
-*.exe~
-*.dll
-*.so
-*.dylib
-*.test
-*.out
-
-# Go workspace stuff
-bin/
 *.log
 
 # Editor / IDE configs
@@ -23,7 +16,3 @@ bin/
 .idea/
 *.swp
 *.swo
-
-# Coverage and debug files
-coverage.*
-debug

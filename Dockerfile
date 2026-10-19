@@ -1,34 +1,24 @@
 # -------- Stage 1: Build --------
-FROM golang:1.23 AS builder
-
-# Set working directory
+FROM rust:1-bookworm AS builder
 WORKDIR /app
 
-# Copy go.mod and go.sum first (for caching dependencies)
-COPY go.mod go.sum ./
-RUN go mod download
+# Cache dependencies separately from sources.
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir src && echo "fn main() {}" > src/main.rs && touch src/lib.rs \
+    && cargo build --release && rm -rf src
 
-# Copy the rest of the source
-COPY . .
-
-# Build statically linked binary
-RUN CGO_ENABLED=0 GOOS=linux go build -o server .
+COPY src ./src
+RUN touch src/main.rs src/lib.rs && cargo build --release
 
 # -------- Stage 2: Runtime --------
-FROM gcr.io/distroless/base-debian12
-
-# Set working directory
+FROM gcr.io/distroless/cc-debian12
 WORKDIR /app
+COPY --from=builder /app/target/release/kvdist /app/kvdist
 
-# Copy compiled binary from builder
-COPY --from=builder /app/server .
-
-# Create a directory for BadgerDB data
 VOLUME ["/data"]
-ENV BADGER_DIR=/data
+ENV KV_DATA_DIR=/data \
+    KV_HTTP_ADDR=0.0.0.0:8080 \
+    KV_PEER_ADDR=0.0.0.0:7070
 
-# Expose HTTP port (adjust if needed)
-EXPOSE 8080
-
-# Run the binary
-ENTRYPOINT ["./server"]
+EXPOSE 8080 7070
+ENTRYPOINT ["/app/kvdist"]

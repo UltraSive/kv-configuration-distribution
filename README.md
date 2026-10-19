@@ -1,123 +1,153 @@
-# RocksDB Based Configuration Distribution Server
-This is a configuration distribution server that stores and serves key-value data for clients over HTTP or Unix sockets. It provides fast local access while keeping persistent storage on disk, allowing updates, reads, and listing of stored items. The system is designed to handle multiple clients efficiently and ensures data consistency, making it suitable for distributing configuration or metadata across applications.
+# kvdist — replicated configuration distribution
 
-## Quick start (Docker)
-Ensure Docker is installed on your system
+A key-value store for distributing configuration from one writer to many
+readers, modelled on Cloudflare's [Quicksilver]. It's written in Rust on top of
+the [fjall] LSM storage engine.
+
+Writes go to a single **root**, which assigns every transaction a
+monotonically increasing **replication index**. **Replicas** pull the log in a
+tree (root → intermediate → edge) and serve reads locally from disk.
+**Proxies** follow the same log but only keep hot values on disk. They fetch
+misses from replicas *at a consistent index*, so they never return data older
+or newer than their own position.
+
+[Quicksilver]: https://blog.cloudflare.com/introducing-quicksilver-configuration-distribution-at-internet-scale/
+[fjall]: https://github.com/fjall-rs/fjall
+
+## Concepts borrowed from Quicksilver
+
+| Quicksilver | kvdist |
+|---|---|
+| Single write aggregator, monotonically increasing index per change | `root` role; each transaction is one log entry with one index |
+| Log entry and data change committed in one storage transaction | One atomic fjall batch writes the data, MVCC history, log entry and replication position |
+| Gap detection (`index == last + 1`) | Every applied entry is checked for contiguity |
+| Incremental hash over the log | blake3 hash chain; entry N's hash covers N‑1 |
+| Per-KV CRC, verified on read | CRC32 over key + record on every read, snapshot export and ingest |
+| Handshake with `DBID`, `LastIndex`; process IDs to prevent self-replication | `Hello{node_id, db_id, last_index, last_hash}`. Rejects foreign databases, self-replication and diverged logs |
+| Resume at `LastIndex + 1`; secondaries with longer history | Resume from the log while it's retained, otherwise automatic snapshot bootstrap; ordered upstream failover |
+| Consistent snapshots to bootstrap new machines | fjall cross-keyspace snapshot streamed in chunks; crash-safe install |
+| Batched commits | Group commit on the root (one fsync per batch); followers coalesce frames into one apply |
+| Heartbeat from the top of the tree for lag | Root head index and clock relayed down the tree; `lag_entries`, `heartbeat_age_ms` |
+| v1.5 replicas with MVCC (read at index) | `history` keyspace, `(key, superseded_at)` → previous version, pruned by retention |
+| v1.5 proxies with a recent-writes window | Proxy applies the whole log, never evicts keys written in the last `proxy_window` indexes, and fetches misses with `GetAt{at, min}` |
+| Persistent cache with LRU eviction | Proxy cache lives in fjall (survives restarts) with LRU eviction to `proxy_capacity` |
+| Key/value separation for large values | fjall blob separation on the data keyspace avoids the LMDB fragmentation problem |
+
+Beyond Quicksilver's published design:
+
+- **Multi-key transactions with compare-and-set.** Each check is `key must be at
+  write index N` (0 = absent). All checks and ops commit atomically or not at all.
+- **Read-your-writes / monotonic reads anywhere.** Every response carries the
+  index it was served at. Pass it back as `min_index` on any node and that node
+  waits until it has caught up.
+- **Writes from any node.** Replicas and proxies forward writes up the tree.
+  A forwarded write is retried on another upstream only if it provably never
+  left the node, so a write is never applied twice.
+- **Change feed** (`/v1/log`), long-polling by index.
+- **Followers don't fsync.** fjall recovers to a consistent prefix and a
+  follower re-fetches any lost tail. Only the root fsyncs before acknowledging.
+
+## How proxy reads stay consistent
+
+A proxy at index `P` applies every log entry, and never evicts a key written
+after `P - proxy_window`. So if a key is missing locally, its last write was at
+or before `L = max(origin, P - proxy_window)`. The proxy sends
+`GetAt{at: P, min: L}` to a replica:
+
+- a replica behind `L` answers `Behind`, and the proxy tries another;
+- a replica between `L` and `P` has the same value the proxy would see at `P`;
+- a replica ahead of `P` answers from MVCC history *as of `P`*.
+
+Either way the proxy returns exactly the state at index `P`.
+
+## Running
+
 ```bash
-curl -fsSL https://get.docker.com | sh
+make build       # cargo build --release
+make test        # unit + multi-node integration tests
+make cluster     # docker compose: root :8080, replica :8081, proxy :8082
 ```
 
-### Build and Run
-```bash
-# Build the container
-make docker-build
+Manually:
 
-# Run the container
-make docker-run
+```bash
+kvdist --role root    --data-dir data/root --http-addr 127.0.0.1:8080 --peer-addr 127.0.0.1:7070
+kvdist --role replica --data-dir data/rep  --http-addr 127.0.0.1:8081 --peer-addr 127.0.0.1:7071 --upstream 127.0.0.1:7070
+kvdist --role proxy   --data-dir data/px   --http-addr 127.0.0.1:8082 --peer-addr ""    --upstream 127.0.0.1:7071 --socket /tmp/kv.sock
 ```
 
-## Quick start (Ubuntu)
+Every flag has a `KV_*` environment variable (see `kvdist --help` and
+`.env.example`).
 
-### Clone The Project
+## HTTP API
+
+Raw values:
+
 ```bash
-# Go back to workspace
-cd ~/projects
-git clone https://github.com/UltraSive/configuration-distribution.git
-cd configuration-distribution
+curl -X PUT  localhost:8080/v1/kv/service/ttl -d 300            # {"index":1}
+curl -X PUT 'localhost:8080/v1/kv/service/ttl?if_index=1' -d 600 # CAS; 409 on conflict
+curl -i      localhost:8082/v1/kv/service/ttl?min_index=2        # x-kv-index, x-kv-write-index
+curl -X DELETE localhost:8080/v1/kv/service/ttl
 ```
 
+JSON queries (`POST /v1/query`). The Unix socket accepts the same bodies:
 
-## Build and Run
-This repo includes a Makefile to simplify building and running.
 ```bash
-# Build the Go binary
-make build
+# Atomic multi-key transaction with checks
+curl localhost:8080/v1/query -H 'content-type: application/json' -d '{
+  "type": "txn",
+  "checks": [{"key": "service/ttl", "index": 2}],
+  "ops": [
+    {"op": "set", "key": "service/ttl", "value": 900},
+    {"op": "set", "key": "service/waf", "value": {"enabled": true}},
+    {"op": "delete", "key": "service/legacy"}
+  ]}'
+# {"index":3}
 
-# Run the server
-make run
+# Consistent multi-get at one index
+curl localhost:8082/v1/query -d '{"type":"get","keys":["service/ttl","nope"],"min_index":3}' -H 'content-type: application/json'
+# {"index":3,"items":{"nope":null,"service/ttl":{"value":900,"write_index":3}}}
 
-# Optional: Clean build artifacts
-make clean
-```
-
-## API Examples
-
-### Insert or Update Key/Value Pairs
-This will create or overwrite keys with new values.
-```bash
-curl -X POST http://localhost:8080/ \
-  -H "Content-Type: application/json" \
-  -d '{
-    "type": "UPDATE",
-    "items": {
-      "foo": {"bar": 123},
-      "hello": "world"
-    }
-  }'
-```
-Response:
-```bash
-{
-  "type": "OK"
-}
+# Prefix scan with pagination (pass "next" back as "after")
+curl localhost:8080/v1/query -d '{"type":"scan","prefix":"service/","limit":100}' -H 'content-type: application/json'
 ```
 
-### Read Keys
-Request one or more keys.
-If keys are not found, they will return null.
-```bash
-curl -X POST http://localhost:8080/ \
-  -H "Content-Type: application/json" \
-  -d '{
-    "type": "GET",
-    "keys": ["foo", "hello", "missingKey"]
-  }'
+Values that are valid JSON come back inline as `value`; anything else comes back as
+`value_b64`. Sets accept either `value` (any JSON) or `value_b64`.
+
+Other endpoints:
+
+- `GET /v1/log?from=N&limit=100&wait_ms=30000`: change feed (root/replicas). Returns `410` once `N` has been pruned.
+- `GET /v1/status`: role, index, hash, floors, upstream, lag.
+- `GET /metrics`: Prometheus text format.
+
+Errors are JSON with a `kind`: `conflict` (409), `bad_request` (400),
+`timeout` (504, `min_index` not reached), `unavailable` (503), `gone` (410),
+`unknown_outcome` (502: a forwarded write may or may not have committed).
+
+## Unix socket
+
+Frames are a 4-byte big-endian length followed by a JSON body, the same shape as
+`/v1/query`. Replies are `{"ok":true,"result":...}` or `{"ok":false,"error":{...}}`.
+
+## Layout
+
 ```
-Response:
-```bash
-{
-  "type": "OK",
-  "data": {
-    "foo": {"bar": 123},
-    "hello": "world",
-    "missingKey": null
-  }
-}
+src/types.rs        indexes, ids, ops, hash-chained LogEntry, CRC'd Record
+src/store.rs        fjall keyspaces: data, history (MVCC), log, meta
+src/applier.rs      single writer thread: group commit, CAS, pruning, eviction
+src/protocol.rs     peer wire protocol (postcard frames)
+src/replication.rs  upstream server (handshake, snapshot, stream) + follower
+src/rpc.rs          peer RPC pool (proxy reads, write forwarding)
+src/node.rs         per-role read/write paths
+src/api.rs          HTTP + Unix socket
+tests/cluster.rs    multi-node tests over real sockets
 ```
 
-### List All Keys
-Returns the full key/value set in the database (filtered by TTL if running in ephemeral mode).
-```bash
-curl -X POST http://localhost:8080/ \
-  -H "Content-Type: application/json" \
-  -d '{"type": "LIST"}'
-```
-Response:
-```bash
-{
-  "type": "OK",
-  "data": {
-    "foo": {"bar": 123},
-    "hello": "world"
-  }
-}
-```
+## Not (yet) implemented
 
-### Delete a Key
-To delete, send an empty value for the key inside an UPDATE request.
-```bash
-curl -X POST http://localhost:8080/ \
-  -H "Content-Type: application/json" \
-  -d '{
-    "type": "UPDATE",
-    "items": {
-      "hello": ""
-    }
-  }'
-```
-Response:
-```bash
-{
-  "type": "OK"
-}
-```
+- No TLS or auth on the peer and HTTP ports. Run them on a trusted network.
+- Single root: there's no leader election or root failover.
+- A diverged log (for example a root restored from an old backup) is refused,
+  not repaired automatically. Wipe the replica's data dir to re-bootstrap it.
+- No Quicksilver v2 data-center tier (sharded L2 cache, relays, reactive prefetch).
