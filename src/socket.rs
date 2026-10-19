@@ -96,6 +96,8 @@ pub enum ClientError {
     /// Client side: the server sent something unexpected.
     #[error("protocol: {0}")]
     Protocol(String),
+    #[error("forbidden: {0}")]
+    Forbidden(String),
 }
 
 impl From<NodeError> for ClientError {
@@ -123,6 +125,7 @@ impl From<NodeError> for ClientError {
             NodeError::Timeout { index, wanted } => ClientError::Timeout { index, wanted },
             NodeError::NotReady(m) => ClientError::NotReady(m),
             NodeError::Gone { floor } => ClientError::Gone { floor },
+            NodeError::Forbidden(m) => ClientError::Forbidden(m),
         }
     }
 }

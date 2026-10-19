@@ -2,12 +2,14 @@
 //! for each role.
 
 use crate::applier::{Applier, ApplierConfig};
+use crate::auth::Tokens;
 use crate::cache::{CacheIndex, CacheLimits, SharedCache, free_disk_bytes};
 use crate::config::{Config, Role};
 use crate::error::WriteError;
 use crate::protocol::{RpcReq, RpcResp};
 use crate::rpc::{CallError, RpcPool};
 use crate::store::Store;
+use crate::tls::TlsSettings;
 use crate::types::*;
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
@@ -30,6 +32,8 @@ pub enum NodeError {
     Write(#[from] WriteError),
     #[error("bad request: {0}")]
     BadRequest(String),
+    #[error("forbidden: {0}")]
+    Forbidden(String),
     #[error("log entries before {floor} are no longer retained")]
     Gone { floor: Index },
     #[error("internal: {0}")]
@@ -109,6 +113,9 @@ pub struct Node {
     pub proxy: Option<ProxyState>,
     /// Peers writes are forwarded to on non-root nodes.
     writes: Option<RpcPool>,
+    pub tls: TlsSettings,
+    /// HTTP bearer tokens; `None` leaves the HTTP API open.
+    pub tokens: Option<Tokens>,
     pub metrics: Metrics,
 }
 
@@ -119,6 +126,8 @@ pub struct ReadOpts {
 
 impl Node {
     pub fn open(cfg: Config) -> anyhow::Result<(Arc<Node>, JoinHandle<()>)> {
+        let tls = TlsSettings::load(&cfg)?;
+        let tokens = cfg.auth_tokens.as_deref().map(Tokens::load).transpose()?;
         let store = Arc::new(Store::open(&cfg.data_dir)?);
         if cfg.role == Role::Root {
             let id = store.init_root()?;
@@ -151,9 +160,10 @@ impl Node {
         let node_id = store.node_id();
         let proxy = cache.map(|cache| ProxyState {
             cache,
-            replicas: RpcPool::new(cfg.replicas.clone(), node_id),
+            replicas: RpcPool::new(cfg.replicas.clone(), node_id, tls.peer_connector.clone()),
         });
-        let writes = (cfg.role != Role::Root).then(|| RpcPool::new(cfg.upstreams.clone(), node_id));
+        let writes = (cfg.role != Role::Root)
+            .then(|| RpcPool::new(cfg.upstreams.clone(), node_id, tls.peer_connector.clone()));
         let node = Node {
             cfg,
             store,
@@ -163,6 +173,8 @@ impl Node {
             upstream: Mutex::new(None),
             proxy,
             writes,
+            tls,
+            tokens,
             metrics: Metrics::default(),
         };
         Ok((Arc::new(node), join))

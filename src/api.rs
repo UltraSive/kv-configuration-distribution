@@ -1,12 +1,14 @@
 //! Client-facing HTTP API: REST plus a JSON query endpoint. The local
 //! Unix socket speaks postcard instead; see [`crate::socket`].
 
+use crate::auth::Access;
 use crate::error::WriteError;
 use crate::node::{Node, NodeError, ReadOpts};
 use crate::types::*;
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, Path, Query, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::extract::{DefaultBodyLimit, Extension, Path, Query, Request, State};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -257,6 +259,10 @@ pub fn error_json(e: &NodeError) -> (StatusCode, Value) {
             StatusCode::GATEWAY_TIMEOUT,
             json!({"error": msg, "kind": "timeout", "index": index, "wanted": wanted}),
         ),
+        NodeError::Forbidden(_) => (
+            StatusCode::FORBIDDEN,
+            json!({"error": msg, "kind": "forbidden"}),
+        ),
         NodeError::Gone { floor } => (
             StatusCode::GONE,
             json!({"error": msg, "kind": "gone", "log_floor": floor}),
@@ -296,8 +302,42 @@ pub fn router(node: Arc<Node>) -> Router {
         .route("/v1/log", get(log_feed))
         .route("/v1/status", get(status))
         .route("/metrics", get(metrics))
+        .route_layer(middleware::from_fn_with_state(node.clone(), authorize))
         .layer(DefaultBodyLimit::max(limit))
         .with_state(node)
+}
+
+/// Bearer-token check. Every route needs at least read access; PUT and
+/// DELETE (and `txn` queries, checked in [`query`]) need write access.
+async fn authorize(State(node): State<Arc<Node>>, mut req: Request, next: Next) -> Response {
+    let access = match &node.tokens {
+        None => Access::Write,
+        Some(tokens) => {
+            let presented = req
+                .headers()
+                .get(header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer "));
+            match presented.and_then(|t| tokens.check(t.trim())) {
+                Some(a) => a,
+                None => {
+                    let body =
+                        json!({"error": "missing or invalid bearer token", "kind": "unauthorized"});
+                    return (
+                        StatusCode::UNAUTHORIZED,
+                        [(header::WWW_AUTHENTICATE, "Bearer")],
+                        Json(body),
+                    )
+                        .into_response();
+                }
+            }
+        }
+    };
+    if matches!(*req.method(), Method::PUT | Method::DELETE) && access < Access::Write {
+        return ApiError(NodeError::Forbidden("this token is read-only".into())).into_response();
+    }
+    req.extensions_mut().insert(access);
+    next.run(req).await
 }
 
 #[derive(Deserialize)]
@@ -401,8 +441,12 @@ async fn delete_raw(
 
 async fn query(
     State(node): State<Arc<Node>>,
+    Extension(access): Extension<Access>,
     Json(q): Json<ClientQuery>,
 ) -> ApiResult<Json<Value>> {
+    if matches!(q, ClientQuery::Txn(_)) && access < Access::Write {
+        return Err(NodeError::Forbidden("this token is read-only".into()).into());
+    }
     Ok(Json(run_query(&node, q).await?))
 }
 

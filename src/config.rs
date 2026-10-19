@@ -35,9 +35,31 @@ pub struct Config {
     #[arg(long, env = "KV_PEER_ADDR", default_value = "0.0.0.0:7070")]
     pub peer_addr: String,
 
-    /// Optional Unix socket for local clients (length-prefixed JSON).
+    /// Optional Unix socket for local clients (postcard frames, see `kvctl`).
     #[arg(long, env = "KV_SOCKET")]
     pub socket: Option<PathBuf>,
+
+    /// Optional Unix socket serving the HTTP API (e.g. for `curl --unix-socket`).
+    #[arg(long, env = "KV_HTTP_SOCKET")]
+    pub http_socket: Option<PathBuf>,
+
+    /// PEM certificate chain for this node. Enables HTTPS on the HTTP API.
+    #[arg(long, env = "KV_TLS_CERT", requires = "tls_key")]
+    pub tls_cert: Option<PathBuf>,
+
+    /// PEM private key for --tls-cert.
+    #[arg(long, env = "KV_TLS_KEY", requires = "tls_cert")]
+    pub tls_key: Option<PathBuf>,
+
+    /// PEM cluster CA. Enables mutual TLS on peer connections: every node's
+    /// certificate must be signed by it (needs --tls-cert/--tls-key).
+    #[arg(long, env = "KV_TLS_CA", requires = "tls_cert")]
+    pub tls_ca: Option<PathBuf>,
+
+    /// File of `<read|write> <token>` lines. Enables bearer-token auth on
+    /// the HTTP API.
+    #[arg(long, env = "KV_AUTH_TOKENS")]
+    pub auth_tokens: Option<PathBuf>,
 
     /// Upstream peers to replicate from, in preference order.
     #[arg(long = "upstream", env = "KV_UPSTREAMS", value_delimiter = ',')]
@@ -96,6 +118,12 @@ pub struct Config {
 
 impl Config {
     pub fn validate(&mut self) -> Result<(), String> {
+        if self.tls_cert.is_some() != self.tls_key.is_some() {
+            return Err("--tls-cert and --tls-key must be given together".into());
+        }
+        if self.tls_ca.is_some() && self.tls_cert.is_none() {
+            return Err("--tls-ca needs --tls-cert and --tls-key".into());
+        }
         if self.role != Role::Root && self.upstreams.is_empty() {
             return Err("replica and proxy nodes need at least one --upstream".into());
         }

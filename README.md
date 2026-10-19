@@ -200,6 +200,70 @@ The HTTP JSON API is still there for anything else.
 
 [postcard]: https://postcard.jamesmunns.com/
 
+## Security
+
+There are three layers, each enabled independently. With none of them set, the
+node logs a warning at startup.
+
+| Surface | Protection | Flags |
+|---|---|---|
+| Peer port (replication, RPC, forwarded writes) | Mutual TLS: both sides present a certificate signed by the cluster CA | `--tls-cert`, `--tls-key`, `--tls-ca` |
+| HTTP API (TCP) | HTTPS, plus bearer tokens with `read`/`write` roles | `--tls-cert`, `--tls-key`, `--auth-tokens` |
+| Unix sockets (`--socket`, `--http-socket`) | File permissions: created `0660` | `--http-socket` also enforces tokens |
+
+**Peer mTLS.** With `--tls-ca`, a node only accepts peers whose certificate
+chains to that CA, and only dials peers that present one. A node without
+the right certificate gets nothing: no snapshot, no log, no reads. Node
+certificates need:
+
+- a SAN matching the address other nodes dial, as a DNS name or an IP;
+- both the `serverAuth` and `clientAuth` extended key usages.
+
+```bash
+# Cluster CA
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 3650 \
+  -subj "/CN=kvdist-ca" -addext "basicConstraints=critical,CA:TRUE" \
+  -addext "keyUsage=critical,keyCertSign,cRLSign" -keyout ca.key -out ca.crt
+
+# One per node; put the names/IPs peers use to reach it in subjectAltName
+openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -subj "/CN=root-1" \
+  -keyout root-1.key -out root-1.csr
+openssl x509 -req -in root-1.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 825 \
+  -out root-1.crt -extfile <(printf '%s\n' \
+    "subjectAltName=DNS:root-1.internal,IP:10.0.0.5" \
+    "extendedKeyUsage=serverAuth,clientAuth" "basicConstraints=CA:FALSE" \
+    "keyUsage=critical,digitalSignature")
+
+kvdist --role root --tls-cert root-1.crt --tls-key root-1.key --tls-ca ca.crt ...
+```
+
+The same certificate serves HTTPS. Without `--tls-ca`, the HTTP API still uses
+TLS, but peer connections stay plaintext.
+
+**Tokens.** `--auth-tokens` points to a file of `<role> <token>` lines.
+`write` implies `read`. Every HTTP route needs a valid
+`Authorization: Bearer <token>`, `/metrics` included. `PUT`, `DELETE` and
+`txn` queries need `write`. Without a valid token the reply is `401`; with a
+read token on a write route it's `403`. Store tokens hashed so the file holds
+no secrets:
+
+```bash
+kvctl hash-token read  "$READ_TOKEN"  >> tokens   # read blake3:6f2c...
+kvctl hash-token write "$DEPLOY_TOKEN" >> tokens
+curl --cacert ca.crt -H "authorization: Bearer $READ_TOKEN" https://node:8080/v1/kv/service/ttl
+```
+
+A write sent to a replica or proxy is authorized by that node's token file,
+then forwarded over mTLS. Keep token files consistent across the cluster.
+
+**HTTP over a Unix socket.** `--http-socket /run/kvdist-http.sock` serves the
+same HTTP API locally, with no TCP and no TLS. This suits non-Rust local
+clients that would rather not speak postcard:
+
+```bash
+curl --unix-socket /run/kvdist-http.sock -H "authorization: Bearer $READ_TOKEN" http://x/v1/kv/service/ttl
+```
+
 ## Layout
 
 ```
@@ -209,17 +273,22 @@ src/applier.rs      single writer thread: group commit, CAS, pruning, eviction
 src/protocol.rs     peer wire protocol (postcard frames)
 src/replication.rs  upstream server (handshake, snapshot, stream) + follower
 src/rpc.rs          peer RPC pool (proxy reads, write forwarding)
+src/tls.rs          mTLS for peers, HTTPS listener
+src/auth.rs         HTTP bearer tokens
 src/node.rs         per-role read/write paths
 src/api.rs          HTTP API
 src/socket.rs       Unix socket API (postcard)
 src/client.rs       Unix socket client library
 src/bin/kvctl.rs    socket CLI
 tests/cluster.rs    multi-node tests over real sockets
+tests/security.rs   mTLS, HTTPS, tokens, HTTP socket
 ```
 
 ## Not (yet) implemented
 
-- No TLS or auth on the peer and HTTP ports. Run them on a trusted network.
+- Any node with a cluster-CA certificate is fully trusted: it can replicate
+  everything and submit writes. There are no per-node permissions.
+- No certificate revocation (CRLs/OCSP); rotate the CA to cut a node off.
 - Single root: there's no leader election or root failover.
 - A diverged log (for example a root restored from an old backup) is refused,
   not repaired automatically. Wipe the replica's data dir to re-bootstrap it.

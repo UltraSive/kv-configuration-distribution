@@ -6,8 +6,8 @@ use crate::types::NodeId;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-use tokio::net::TcpStream;
 use tokio::time::timeout;
+use tokio_rustls::TlsConnector;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const CALL_TIMEOUT: Duration = Duration::from_secs(5);
@@ -25,16 +25,18 @@ pub enum CallError {
 pub struct RpcPool {
     pub addrs: Vec<String>,
     node_id: NodeId,
+    tls: Option<TlsConnector>,
     idle: Vec<Mutex<Vec<Conn>>>,
     next: AtomicUsize,
 }
 
 impl RpcPool {
-    pub fn new(addrs: Vec<String>, node_id: NodeId) -> Self {
+    pub fn new(addrs: Vec<String>, node_id: NodeId, tls: Option<TlsConnector>) -> Self {
         let idle = addrs.iter().map(|_| Mutex::new(Vec::new())).collect();
         Self {
             addrs,
             node_id,
+            tls,
             idle,
             next: AtomicUsize::new(0),
         }
@@ -55,10 +57,7 @@ impl RpcPool {
 
     async fn connect(&self, i: usize) -> Result<Conn> {
         let addr = &self.addrs[i];
-        let stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
-            .await
-            .map_err(|_| Error::Protocol(format!("connect to {addr} timed out")))??;
-        let mut conn = protocol::framed(stream);
+        let mut conn = protocol::connect(addr, self.tls.as_ref(), CONNECT_TIMEOUT).await?;
         protocol::send(
             &mut conn,
             &Hello::Rpc {

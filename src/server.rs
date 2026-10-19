@@ -2,6 +2,7 @@
 
 use crate::config::{Config, Role};
 use crate::node::Node;
+use crate::tls::TlsListener;
 use crate::{api, replication, socket};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -43,15 +44,16 @@ pub async fn start(mut cfg: Config) -> anyhow::Result<Running> {
     let listener = TcpListener::bind(&cfg.http_addr).await?;
     let http_addr = listener.local_addr()?;
     let router = api::router(node.clone());
-    let shutdown = cancel.clone().cancelled_owned();
-    tracker.spawn(async move {
-        if let Err(e) = axum::serve(listener, router)
-            .with_graceful_shutdown(shutdown)
-            .await
-        {
-            tracing::error!("http server failed: {e}");
+    match node.tls.http.clone() {
+        Some(acceptor) => {
+            let tls = TlsListener::spawn(listener, acceptor, cancel.clone(), tracker.clone())?;
+            spawn_http(&tracker, &cancel, tls, router.clone());
         }
-    });
+        None => spawn_http(&tracker, &cancel, listener, router.clone()),
+    }
+    if let Some(path) = &cfg.http_socket {
+        spawn_http(&tracker, &cancel, socket::bind(path)?, router);
+    }
 
     if let Some(path) = &cfg.socket {
         let listener = socket::bind(path)?;
@@ -80,10 +82,21 @@ pub async fn start(mut cfg: Config) -> anyhow::Result<Running> {
         }
     });
 
+    if node.tokens.is_none() {
+        tracing::warn!("HTTP API has no authentication; set --auth-tokens");
+    }
+    if cfg.tls_ca.is_none() && (peer_addr.is_some() || cfg.role != Role::Root) {
+        tracing::warn!("peer connections are unencrypted and unauthenticated; set --tls-ca");
+    }
     tracing::info!(
-        "{:?} node {} serving http on {http_addr}{}",
+        "{:?} node {} serving {} on {http_addr}{}",
         cfg.role,
         node.store.node_id(),
+        if node.tls.http.is_some() {
+            "https"
+        } else {
+            "http"
+        },
         peer_addr
             .map(|a| format!(", peers on {a}"))
             .unwrap_or_default()
@@ -104,11 +117,34 @@ impl Running {
         self.cancel.cancel();
         self.tracker.close();
         self.tracker.wait().await;
-        if let Some(path) = &self.node.cfg.socket {
+        for path in [&self.node.cfg.socket, &self.node.cfg.http_socket]
+            .into_iter()
+            .flatten()
+        {
             let _ = std::fs::remove_file(path);
         }
         // Dropping the last node handle closes the applier's queue.
         drop(self.node);
         let _ = tokio::task::spawn_blocking(move || self.applier.join()).await;
     }
+}
+
+fn spawn_http<L>(
+    tracker: &TaskTracker,
+    cancel: &CancellationToken,
+    listener: L,
+    router: axum::Router,
+) where
+    L: axum::serve::Listener,
+    L::Addr: std::fmt::Debug,
+{
+    let shutdown = cancel.clone().cancelled_owned();
+    tracker.spawn(async move {
+        if let Err(e) = axum::serve(listener, router)
+            .with_graceful_shutdown(shutdown)
+            .await
+        {
+            tracing::error!("http server failed: {e}");
+        }
+    });
 }

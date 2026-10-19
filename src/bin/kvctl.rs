@@ -45,6 +45,12 @@ enum Cmd {
     },
     /// Node status as JSON.
     Status,
+    /// Print a `--auth-tokens` line for a token without storing it in clear text.
+    HashToken {
+        #[arg(value_parser = ["read", "write"])]
+        role: String,
+        token: String,
+    },
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -60,8 +66,16 @@ async fn main() -> ExitCode {
 }
 
 async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
-    let mut kv = LocalClient::connect(&cli.socket).await?;
     let mut out = std::io::stdout().lock();
+    if let Cmd::HashToken { role, token } = &cli.cmd {
+        writeln!(
+            out,
+            "{role} blake3:{}",
+            blake3::hash(token.as_bytes()).to_hex()
+        )?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    let mut kv = LocalClient::connect(&cli.socket).await?;
     match cli.cmd {
         Cmd::Get { key } => {
             let (index, item) = kv.get_one(key, cli.min_index).await?;
@@ -91,6 +105,7 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
                 out.write_all(b"\n")?;
             }
         }
+        Cmd::HashToken { .. } => unreachable!("handled above"),
         Cmd::Status => writeln!(
             out,
             "{}",

@@ -69,7 +69,7 @@ pub async fn serve(
 }
 
 async fn handle_conn(node: Arc<Node>, stream: TcpStream) -> Result<()> {
-    let mut conn = protocol::framed(stream);
+    let mut conn = protocol::accept(stream, node.tls.peer_acceptor.as_ref()).await?;
     let hello: Hello = timeout(IDLE_TIMEOUT, protocol::recv(&mut conn))
         .await
         .map_err(|_| Error::Protocol("no hello".into()))??
@@ -435,10 +435,8 @@ pub async fn follow(node: Arc<Node>, cancel: CancellationToken) {
 }
 
 async fn follow_once(node: &Arc<Node>, addr: &str) -> Result<()> {
-    let stream = timeout(Duration::from_secs(3), TcpStream::connect(addr))
-        .await
-        .map_err(|_| Error::Protocol("connect timed out".into()))??;
-    let mut conn = protocol::framed(stream);
+    let tls = node.tls.peer_connector.as_ref();
+    let mut conn = protocol::connect(addr, tls, Duration::from_secs(3)).await?;
     let st = node.store.state();
     let is_proxy = node.role() == Role::Proxy;
     protocol::send(
